@@ -10,8 +10,10 @@ This service integrates with the existing Convo frontend and focuses specificall
 **Stable Branch:** `main`
 Production-ready and tested.
 
-Frontend:
-[https://github.com/Capstone-Project-BUET-CSE-21/convo-frontend](https://github.com/Capstone-Project-BUET-CSE-21/convo-frontend)
+Other relevant repositories:
+
+* Frontend: [https://github.com/Capstone-Project-BUET-CSE-21/convo-frontend](https://github.com/Capstone-Project-BUET-CSE-21/convo-frontend)
+* Signalling Server / Main Backend: [https://github.com/Capstone-Project-BUET-CSE-21/convo-backend](https://github.com/Capstone-Project-BUET-CSE-21/convo-backend)
 
 ---
 
@@ -28,7 +30,7 @@ This microservice provides:
 
 ## Project Structure
 
-```
+```bash
 audio-watermark/
 ├── pom.xml
 ├── src/
@@ -119,7 +121,7 @@ Handles:
 
 Check:
 
-```
+```bash
 java -version
 ```
 
@@ -129,20 +131,20 @@ java -version
 
 ### 1. Clone
 
-```
+```bash
 git clone https://github.com/Capstone-Project-BUET-CSE-21/convo-backend
 cd convo-backend/audio-watermark
 ```
 
 ### 2. Run
 
-```
+```bash
 ./mvnw spring-boot:run
 ```
 
 (Windows)
 
-```
+```bash
 mvnw.cmd spring-boot:run
 ```
 
@@ -150,7 +152,7 @@ mvnw.cmd spring-boot:run
 
 ### 3. Server
 
-```
+```bash
 http://localhost:8080
 ```
 
@@ -160,7 +162,7 @@ http://localhost:8080
 
 Simple layered architecture:
 
-```
+```text
 Controller → Service → Repository → Database
 ```
 
@@ -188,7 +190,7 @@ Controller → Service → Repository → Database
 
 **Server not starting**
 
-```
+```bash
 mvn clean install
 ```
 
@@ -206,3 +208,4 @@ Check:
 * Ensure frontend is pointing to correct service
 
 ---
+
