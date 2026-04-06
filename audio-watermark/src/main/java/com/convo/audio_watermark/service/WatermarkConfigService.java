@@ -38,6 +38,7 @@ public class WatermarkConfigService {
         return repository.save(config);
     }
 
+    // Generate a unique 6-character alphanumeric seed
     private String generateUniqueSeed() {
         String seed;
         do {
