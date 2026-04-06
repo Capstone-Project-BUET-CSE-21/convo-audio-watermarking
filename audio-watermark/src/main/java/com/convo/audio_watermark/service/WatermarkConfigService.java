@@ -31,7 +31,7 @@ public class WatermarkConfigService {
         config.setSessionId(sessionId);
         config.setUserId(userId);
         config.setSeed(generateUniqueSeed());
-        config.setAlpha(0.02);
+        config.setAlpha(0.002);
         config.setFrameSize(256);
         config.setCreatedAt(LocalDateTime.now());
 
