@@ -30,7 +30,6 @@ public class WebConfig {
         CorsConfiguration configuration = new CorsConfiguration();
         configuration.setAllowedOrigins(Arrays.asList(
                 "http://localhost:5173",
-                "http://localhost:3000",
                 "https://convo-frontend-nine.vercel.app",
                 "https://convo-frontend-alpha.vercel.app"
         ));
@@ -53,7 +52,6 @@ public class WebConfig {
                 registry.addMapping("/**")
                         .allowedOrigins(
                                 "http://localhost:5173",
-                                "http://localhost:3000",
                                 "https://convo-frontend-nine.vercel.app",
                                 "https://convo-frontend-alpha.vercel.app"
                         )
