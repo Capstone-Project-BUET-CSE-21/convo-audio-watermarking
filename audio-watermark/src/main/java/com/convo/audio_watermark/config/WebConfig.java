@@ -22,8 +22,7 @@ public class WebConfig {
     private static final List<String> ALLOWED_ORIGIN_PATTERNS = Arrays.asList(
             "http://localhost:*",
             "https://convo-frontend-nine.vercel.app",
-            "https://convo-frontend-alpha.vercel.app",
-            "https://*.vercel.app");
+            "https://convo-frontend-alpha.vercel.app");
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
