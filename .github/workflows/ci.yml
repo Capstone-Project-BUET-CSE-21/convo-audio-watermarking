@@ -1,0 +1,52 @@
+name: Audio Watermark CI
+
+on:
+    pull_request:
+        paths:
+            - "audio-watermark/**"
+            - ".github/workflows/ci.yml"
+    push:
+        branches:
+            - main
+        paths:
+            - "audio-watermark/**"
+            - ".github/workflows/ci.yml"
+
+permissions:
+    contents: read
+
+concurrency:
+    group: audio-watermark-deploy
+    cancel-in-progress: true
+
+jobs:
+    test:
+        name: Test Audio Watermark
+        runs-on: ubuntu-latest
+        defaults:
+            run:
+                working-directory: audio-watermark
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Setup Java
+              uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: 21
+                  cache: maven
+
+            - name: Run audio-watermark tests
+              run: ./mvnw -q clean test
+
+    deploy-production:
+        name: Deploy Audio Watermark to Render
+        needs: test
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        steps:
+            - name: Trigger Render deploy hook
+              env:
+                  RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL_STAGE }}
+              run: curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
