@@ -23,9 +23,9 @@ public class AudioWatermarkApplication {
                 .ignoreIfMissing()
                 .load();
 
-        setPropertyIfPresent("spring.datasource.url", resolveValue("DB_URL", localDotenv));
-        setPropertyIfPresent("spring.datasource.username", resolveValue("DB_USER", localDotenv));
-        setPropertyIfPresent("spring.datasource.password", resolveValue("DB_PASS", localDotenv));
+        setPropertyIfPresent("spring-datasource-url", resolveValue("DB_URL", localDotenv));
+        setPropertyIfPresent("spring-datasource-username", resolveValue("DB_USER", localDotenv));
+        setPropertyIfPresent("spring-datasource-password", resolveValue("DB_PASS", localDotenv));
 
         SpringApplication.run(AudioWatermarkApplication.class, args);
     }
