@@ -1,7 +1,6 @@
 package com.convo.audio_watermark.service;
 
 import com.convo.audio_watermark.dto.WatermarkDetectionResponse;
-import com.convo.audio_watermark.entity.WatermarkConfig;
 import com.convo.audio_watermark.repository.WatermarkConfigRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -51,13 +50,14 @@ public class WatermarkDetectionService {
     public WatermarkDetectionResponse detect(MultipartFile audioFile, String sessionId)
             throws IOException, UnsupportedAudioFileException {
 
-        // ── 1. Fetch all users registered in this session ──────────────────────
-        List<WatermarkConfig> sessionConfigs = repository.findBySessionId(sessionId);
+        // ── 1. Fetch all registered watermark configs for this meeting ───────
+        List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs =
+            repository.findDetectionConfigsByMeetingCode(sessionId);
         if (sessionConfigs.isEmpty()) {
             return new WatermarkDetectionResponse(
                     null, sessionId, 0.0, false, 0, 0,
                     Collections.emptyMap(),
-                    "No registered users found for session: " + sessionId);
+                "No registered users found for watermark detection.");
         }
 
         // ── 2. Decode audio to float samples ───────────────────────────────────
@@ -78,7 +78,7 @@ public class WatermarkDetectionService {
         // ── 4. Score each user using their DB seed and alpha ───────────────────
         Map<String, Double> allUserScores = new LinkedHashMap<>();
 
-        for (WatermarkConfig config : sessionConfigs) {
+        for (WatermarkConfigRepository.DetectionConfigProjection config : sessionConfigs) {
             double score = computeAverageCorrelation(frames, config.getSeed(), frameSize);
             allUserScores.put(config.getUserId(), round4(score));
         }
@@ -99,7 +99,7 @@ public class WatermarkDetectionService {
         // ── 6. Compute threshold for the winning user using their DB config ────
         final String finalBestUser = bestUser;
 
-        WatermarkConfig winnerConfig = sessionConfigs.stream()
+        WatermarkConfigRepository.DetectionConfigProjection winnerConfig = sessionConfigs.stream()
             .filter(c -> c.getUserId().equals(finalBestUser))
             .findFirst()
             .orElse(sessionConfigs.get(0));

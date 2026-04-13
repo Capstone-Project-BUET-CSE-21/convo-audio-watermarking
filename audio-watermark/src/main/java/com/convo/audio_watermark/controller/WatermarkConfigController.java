@@ -16,16 +16,14 @@ public class WatermarkConfigController {
 
     @GetMapping("/config")
     public Map<String, Object> getConfig(
-        @RequestParam String sessionId,
-        @RequestParam String userId
-    ) {
-        WatermarkConfig config = service.getOrCreateConfig(sessionId, userId);
-        System.out.println("Returning watermark config for sessionId=" + sessionId + " userId=" + userId);
+            @RequestParam String roomId,
+            @RequestParam String userId) {
+        WatermarkConfig config = service.getOrCreateConfig(roomId, userId);
+        System.out.println("Returning watermark config for roomId=" + roomId + " userId=" + userId);
 
         return Map.of(
-            "seed", config.getSeed(),
-            "alpha", config.getAlpha(),
-            "frameSize", config.getFrameSize()
-        );
+                "seed", config.getSeed(),
+                "alpha", config.getAlpha(),
+                "frameSize", config.getFrameSize());
     }
 }
