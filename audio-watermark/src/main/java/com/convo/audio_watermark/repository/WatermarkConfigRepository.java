@@ -34,6 +34,8 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
     interface DetectionConfigProjection {
         String getUserId();
 
+        String getDisplayName();
+
         String getSeed();
 
         Double getAlpha();
@@ -44,11 +46,13 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
     @Query(value = """
             select
                 cast(mu.user_id as text) as userId,
+                coalesce(nullif(u.display_name, ''), cast(mu.user_id as text)) as displayName,
                 wc.seed as seed,
                 wc.alpha as alpha,
                 wc.frame_size as frameSize
             from watermark_config wc
             join meeting_user mu on wc.meeting_user_id = mu.id
+            join users u on mu.user_id = u.id
             join meetings m on mu.meeting_id = m.id
             where m.meeting_code = :meetingCode
             """, nativeQuery = true)
