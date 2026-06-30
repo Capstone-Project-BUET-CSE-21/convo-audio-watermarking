@@ -40,6 +40,8 @@ public class WatermarkConfigService {
         config.setAlpha(0.002);
         config.setFrameSize(256);
         config.setCreatedAt(LocalDateTime.now());
+        config.setAnalysisWindowSize(512); 
+        config.setNumBands(24);
 
         return repository.save(config);
     }

@@ -24,6 +24,8 @@ public class WatermarkConfigController {
         return Map.of(
                 "seed", config.getSeed(),
                 "alpha", config.getAlpha(),
-                "frameSize", config.getFrameSize());
+                "frameSize", config.getFrameSize(),
+                "analysisWindowSize", config.getAnalysisWindowSize(),
+                "numBands", config.getNumBands());
     }
 }

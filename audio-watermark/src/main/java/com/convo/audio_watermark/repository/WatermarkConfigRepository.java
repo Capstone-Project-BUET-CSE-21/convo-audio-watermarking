@@ -41,6 +41,10 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
         Double getAlpha();
 
         Integer getFrameSize();
+
+        Integer getAnalysisWindowSize();
+ 
+        Integer getNumBands();
     }
 
     @Query(value = """
