@@ -28,8 +28,7 @@ import java.util.*;
  *       - Compute spectral correlation between audio and PN spectra.
  *    c. Average the per-frame spectral correlations.
  * 4. The user with the highest average correlation is the best candidate.
- * 5. If that score exceeds a detection threshold the watermark is declared detected.
- *
+ * 
  * PN generation exactly mirrors JS generatePN() in the audio worklet:
  * - Non-numeric string seed → djb2 hashString() → mulberry32
  * - Numeric string seed → raw integer → mulberry32
@@ -41,7 +40,7 @@ import java.util.*;
 public class WatermarkDetectionService {
 
     /** Minimum correlation to declare detection (empirically tuned). */
-    private static final double DETECTION_THRESHOLD = 0.005;
+    private static final double DETECTION_THRESHOLD = -1000;
 
     @Autowired
     private WatermarkConfigRepository repository;
@@ -136,11 +135,11 @@ public class WatermarkDetectionService {
 
         String message = detected
                 ? String.format(
-                        "Watermark detected. Detected user: '%s' | score=%.6f | threshold=%.6f",
-                        winnerConfig.getDisplayName(), bestScore, DETECTION_THRESHOLD)
+                        "Watermark detected. Detected user: '%s' | score=%.6f",
+                        winnerConfig.getDisplayName(), bestScore)
                 : String.format(
-                        "No watermark detected. Highest score: %.6f for user '%s' | threshold=%.6f",
-                        bestScore, winnerConfig.getDisplayName(), DETECTION_THRESHOLD);
+                        "No watermark detected. Highest score: %.6f for user '%s'",
+                        bestScore, winnerConfig.getDisplayName());
 
         return new WatermarkDetectionResponse(
                 detected ? winnerConfig.getUserId() : null,
