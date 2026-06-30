@@ -27,11 +27,11 @@ public class WatermarkConfig {
     private LocalDateTime createdAt;
 
     // Width of the analysis window used for masking computation (hop * 2 for 50% overlap-add).
-    @Column(name = "analysis_window_size", nullable = false)
+    @Column(name = "analysis_window_size")
     private Integer analysisWindowSize;
  
     // Number of Bark critical bands used to compute the masking threshold.
-    @Column(name = "num_bands", nullable = false)
+    @Column(name = "num_bands")
     private Integer numBands;
 
     // Getters and Setters

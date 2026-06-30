@@ -53,7 +53,9 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
                 coalesce(nullif(u.display_name, ''), cast(mu.user_id as text)) as displayName,
                 wc.seed as seed,
                 wc.alpha as alpha,
-                wc.frame_size as frameSize
+                wc.frame_size as frameSize,
+                wc.analysis_window_size as analysisWindowSize,
+                wc.num_bands as numBands
             from watermark_config wc
             join meeting_user mu on wc.meeting_user_id = mu.id
             join users u on mu.user_id = u.id

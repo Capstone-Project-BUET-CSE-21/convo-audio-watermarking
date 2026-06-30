@@ -17,28 +17,31 @@ import java.util.*;
  *
  * 1. Look up every user registered in the session from the database.
  * 2. Decode the uploaded audio to normalised float PCM samples.
- * 3. Segment the samples into frames of frameSize (same as embedding).
- * 4. For each user in the session:
- * a. Regenerate their PN sequence from their DB seed using the
- * same PRNG as the front-end (mulberry32 + hashString/numeric).
- * b. Compute the average raw dot-product correlation across all frames.
- * 5. The user with the highest correlation score is the best candidate.
- * 6. If that score exceeds alpha * frameSize * pnPower * 0.5 the
- * watermark is declared detected.
+ * 3. For each user in the session:
+ *    a. Create a streaming PRNG from their seed (same as the embedder).
+ *    b. Process hop-aligned frames using the same analysis window size:
+ *       - Window the audio with a Hann window.
+ *       - FFT the windowed audio.
+ *       - Generate analysisSize fresh PN values from the streaming PRNG
+ *         (consuming the same count the embedder did for that frame).
+ *       - FFT the PN.
+ *       - Compute spectral correlation between audio and PN spectra.
+ *    c. Average the per-frame spectral correlations.
+ * 4. The user with the highest average correlation is the best candidate.
+ * 5. If that score exceeds a detection threshold the watermark is declared detected.
  *
  * PN generation exactly mirrors JS generatePN() in the audio worklet:
  * - Non-numeric string seed → djb2 hashString() → mulberry32
  * - Numeric string seed → raw integer → mulberry32
  * - Chips: rand() * 2 − 1 (continuous float, not binary ±1)
  *
- * Correlation mirrors JS correlate():
- * corr = Σ frame[i] * pn[i] (raw dot product, no normalisation)
+ * FFT, Hann window, and Bark-band mapping are ported from the JS worklet.
  */
 @Service
 public class WatermarkDetectionService {
 
-    /** Threshold multiplier: alpha * frameSize * pnPower * THRESHOLD_FACTOR */
-    private static final double THRESHOLD_FACTOR = 0.3;
+    /** Minimum correlation to declare detection (empirically tuned). */
+    private static final double DETECTION_THRESHOLD = 0.005;
 
     @Autowired
     private WatermarkConfigRepository repository;
@@ -61,8 +64,11 @@ public class WatermarkDetectionService {
                     "No registered users found for watermark detection.");
         }
 
-        // ── 2. Decode audio to float samples ───────────────────────────────────
-        float[] samples = decodeAudioToFloatSamples(audioFile);
+        // ── 2. Decode audio to float samples & extract sample rate ──────────
+        DecodedAudio decoded = decodeAudioToFloatSamples(audioFile);
+        float[] samples = decoded.samples;
+        float sampleRate = decoded.sampleRate;
+
         if (samples.length == 0) {
             return new WatermarkDetectionResponse(
                     null, null, sessionId, 0.0, false, 0, sessionConfigs.size(),
@@ -71,23 +77,45 @@ public class WatermarkDetectionService {
                     "Audio file is empty or could not be decoded.");
         }
 
-        // All users in the same session share the same frameSize
+        // All users in the same session share the same frameSize / analysisWindowSize / numBands
         int frameSize = sessionConfigs.get(0).getFrameSize();
+        int analysisSize = sessionConfigs.get(0).getAnalysisWindowSize() != null
+                ? sessionConfigs.get(0).getAnalysisWindowSize() : frameSize * 2;
+        int numBands = sessionConfigs.get(0).getNumBands() != null
+                ? sessionConfigs.get(0).getNumBands() : 24;
 
-        // ── 3. Segment into non-overlapping frames ─────────────────────────────
-        List<float[]> frames = segmentIntoFrames(samples, frameSize);
+        // Precompute shared resources
+        float[] window = hannWindow(analysisSize);
+        int[] binToBand = buildBinToBandMap(analysisSize, sampleRate, numBands);
 
-        // ── 4. Score each user using their DB seed and alpha ───────────────────
+        // Number of hop-aligned frames
+        int hop = frameSize;
+        int numFrames = 0;
+        for (int off = 0; off + analysisSize <= samples.length; off += hop) {
+            numFrames++;
+        }
+
+        if (numFrames == 0) {
+            return new WatermarkDetectionResponse(
+                    null, null, sessionId, 0.0, false, 0, sessionConfigs.size(),
+                    Collections.emptyMap(),
+                    Collections.emptyMap(),
+                    "Audio too short for detection (need at least " + analysisSize + " samples).");
+        }
+
+        // ── 3. Score each user using spectral correlation ───────────────────
         Map<String, Double> allUserScores = new LinkedHashMap<>();
         Map<String, String> userDisplayNames = new LinkedHashMap<>();
 
         for (WatermarkConfigRepository.DetectionConfigProjection config : sessionConfigs) {
-            double score = computeAverageCorrelation(frames, config.getSeed(), frameSize);
+            double score = computeSpectralCorrelation(
+                    samples, config.getSeed(), hop, analysisSize, numBands,
+                    sampleRate, window, binToBand, config.getAlpha());
             allUserScores.put(config.getUserId(), round4(score));
             userDisplayNames.put(config.getUserId(), config.getDisplayName());
         }
 
-        // ── 5. Find the user with the highest score ────────────────────────────
+        // ── 4. Find the user with the highest score ─────────────────────────
         String bestUserId = null;
         double bestScore = Double.NEGATIVE_INFINITY;
         for (Map.Entry<String, Double> entry : allUserScores.entrySet()) {
@@ -97,30 +125,22 @@ public class WatermarkDetectionService {
             }
         }
 
-        // ── 6. Compute threshold for the winning user using their DB config ────
-        // threshold = alpha * frameSize * pnPower * 0.5
-        // This mirrors JS: alpha * FRAME * pnPower * 0.5
-        // ── 6. Compute threshold for the winning user using their DB config ────
-        final String finalBestUser = bestUserId;
+        // ── 5. Apply detection threshold ────────────────────────────────────
+        boolean detected = bestScore >= DETECTION_THRESHOLD;
 
+        final String finalBestUser = bestUserId;
         WatermarkConfigRepository.DetectionConfigProjection winnerConfig = sessionConfigs.stream()
                 .filter(c -> c.getUserId().equals(finalBestUser))
                 .findFirst()
                 .orElse(sessionConfigs.get(0));
 
-        float[] winnerPN = generatePN(winnerConfig.getSeed(), frameSize);
-        double pnPower = computePnPower(winnerPN);
-        double threshold = winnerConfig.getAlpha() * frameSize * pnPower * THRESHOLD_FACTOR;
-
-        boolean detected = bestScore >= threshold;
-
         String message = detected
                 ? String.format(
-                        "Watermark detected. Detected user: '%s' | score=%.4f | threshold=%.4f",
-                        winnerConfig.getDisplayName(), bestScore, threshold)
+                        "Watermark detected. Detected user: '%s' | score=%.6f | threshold=%.6f",
+                        winnerConfig.getDisplayName(), bestScore, DETECTION_THRESHOLD)
                 : String.format(
-                        "No watermark detected. Highest score: %.4f for user '%s' | threshold=%.4f",
-                        bestScore, winnerConfig.getDisplayName(), threshold);
+                        "No watermark detected. Highest score: %.6f for user '%s' | threshold=%.6f",
+                        bestScore, winnerConfig.getDisplayName(), DETECTION_THRESHOLD);
 
         return new WatermarkDetectionResponse(
                 detected ? winnerConfig.getUserId() : null,
@@ -128,7 +148,7 @@ public class WatermarkDetectionService {
                 sessionId,
                 round4(bestScore),
                 detected,
-                frames.size(),
+                numFrames,
                 sessionConfigs.size(),
                 allUserScores,
                 userDisplayNames,
@@ -136,15 +156,230 @@ public class WatermarkDetectionService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Audio decoding
+    // Spectral correlation — mirrors the embedder pipeline
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Decode the uploaded audio file to normalised float32 samples in [-1, +1].
-     * Requests little-endian 16-bit mono PCM so that pcmBytesToFloats()
-     * can read the bytes directly without any byte-swap.
+     * Compute the average spectral correlation between the audio and the
+     * watermark that would have been embedded by the given seed.
+     *
+     * This mirrors the embedder exactly:
+     * - A streaming PRNG is created from the seed.
+     * - For each hop-aligned frame, analysisSize PN values are consumed
+     *   (same as the embedder), FFTed, and correlated against the audio spectrum.
      */
-    private float[] decodeAudioToFloatSamples(MultipartFile audioFile)
+    private double computeSpectralCorrelation(
+            float[] samples, String seed, int hop, int analysisSize,
+            int numBands, float sampleRate, float[] window, int[] binToBand, double alpha) {
+
+        // Create a streaming PRNG — same initial state as the embedder
+        long[] prngState = { resolveSeed(seed) };
+
+        // The embedder's margin in linear amplitude
+        double marginLinear = Math.pow(10.0, alpha / 20.0);
+
+        // Scratch buffers
+        double[] audioRe = new double[analysisSize];
+        double[] audioIm = new double[analysisSize];
+        double[] pnRe = new double[analysisSize];
+        double[] pnIm = new double[analysisSize];
+        double[] bandEnergy = new double[numBands];
+        double[] bandLogSum = new double[numBands];
+        double[] bandCount = new double[numBands];
+        double[] bandFlatness = new double[numBands];
+        double[] bandThreshold = new double[numBands];
+
+        double totalCorrelation = 0.0;
+        int numFrames = 0;
+
+        for (int off = 0; off + analysisSize <= samples.length; off += hop) {
+            // ── 1. Window the audio ─────────────────────────────────────────
+            for (int i = 0; i < analysisSize; i++) {
+                audioRe[i] = samples[off + i] * window[i];
+                audioIm[i] = 0.0;
+            }
+            fft(audioRe, audioIm, false);
+
+            // ── 2. Bark-band energy + spectral flatness ─────────────────────
+            Arrays.fill(bandEnergy, 0.0);
+            Arrays.fill(bandLogSum, 0.0);
+            Arrays.fill(bandCount, 0.0);
+            for (int k = 0; k < analysisSize / 2; k++) {
+                double mag2 = audioRe[k] * audioRe[k] + audioIm[k] * audioIm[k];
+                int b = binToBand[k];
+                bandEnergy[b] += mag2;
+                bandLogSum[b] += Math.log(mag2 + 1e-12);
+                bandCount[b] += 1.0;
+            }
+            for (int b = 0; b < numBands; b++) {
+                double count = Math.max(bandCount[b], 1.0);
+                double geoMean = Math.exp(bandLogSum[b] / count);
+                double arithMean = bandEnergy[b] / count;
+                bandFlatness[b] = geoMean / (arithMean + 1e-12);
+                bandEnergy[b] = arithMean;
+            }
+
+            // ── 3. Masking threshold per band ───────────────────────────────
+            for (int b = 0; b < numBands; b++) {
+                double flat = Math.min(Math.max(bandFlatness[b], 0.0), 1.0);
+                double offsetDb = 18.0 - flat * 12.0;
+                double energyDb = 10.0 * Math.log10(bandEnergy[b] + 1e-12);
+                bandThreshold[b] = Math.pow(10.0, (energyDb - offsetDb) / 10.0);
+            }
+            // 3-tap spreading
+            double[] spreadThreshold = Arrays.copyOf(bandThreshold, numBands);
+            for (int b = 0; b < numBands; b++) {
+                double left = b > 0 ? bandThreshold[b - 1] : bandThreshold[b];
+                double right = b < numBands - 1 ? bandThreshold[b + 1] : bandThreshold[b];
+                spreadThreshold[b] = 0.5 * bandThreshold[b] + 0.25 * left + 0.25 * right;
+            }
+
+            // ── 4. Generate this frame's PN spectrum (streaming PRNG) ───────
+            for (int k = 0; k < analysisSize; k++) {
+                pnRe[k] = mulberry32Next(prngState) * 2.0 - 1.0;
+                pnIm[k] = 0.0;
+            }
+            fft(pnRe, pnIm, false);
+
+            // ── 5. Shape PN spectrum by sqrt(threshold) * margin ────────────
+            for (int k = 0; k < analysisSize / 2; k++) {
+                int b = binToBand[k];
+                double mag = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
+                double gain = (Math.sqrt(spreadThreshold[b]) * marginLinear) / mag;
+                pnRe[k] *= gain;
+                pnIm[k] *= gain;
+                int mirror = (analysisSize - k) % analysisSize;
+                pnRe[mirror] = pnRe[k];
+                pnIm[mirror] = -pnIm[k];
+            }
+
+            // ── 6. Spectral correlation ─────────────────────────────────────
+            // Correlation = Σ Re(audio) * Re(pn) + Im(audio) * Im(pn)
+            // over positive frequencies, normalised
+            double corr = 0.0;
+            double audioPower = 0.0;
+            double pnPower = 0.0;
+            for (int k = 1; k < analysisSize / 2; k++) {
+                corr += audioRe[k] * pnRe[k] + audioIm[k] * pnIm[k];
+                audioPower += audioRe[k] * audioRe[k] + audioIm[k] * audioIm[k];
+                pnPower += pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k];
+            }
+            // Normalised correlation coefficient
+            double denom = Math.sqrt(audioPower * pnPower);
+            double normCorr = denom > 1e-12 ? corr / denom : 0.0;
+
+            totalCorrelation += normCorr;
+            numFrames++;
+        }
+
+        return numFrames > 0 ? totalCorrelation / numFrames : 0.0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FFT — exact port of the JS worklet's radix-2 iterative FFT
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * In-place iterative radix-2 FFT (or inverse FFT when invert=true).
+     * Mirrors the JS _fft(re, im, invert) in audio-processor.worklet.js.
+     */
+    private static void fft(double[] re, double[] im, boolean invert) {
+        int n = re.length;
+        // Bit-reversal permutation
+        for (int i = 1, j = 0; i < n; i++) {
+            int bit = n >> 1;
+            for (; (j & bit) != 0; bit >>= 1) {
+                j ^= bit;
+            }
+            j ^= bit;
+            if (i < j) {
+                double tmp = re[i]; re[i] = re[j]; re[j] = tmp;
+                tmp = im[i]; im[i] = im[j]; im[j] = tmp;
+            }
+        }
+        // Butterfly passes
+        for (int len = 2; len <= n; len <<= 1) {
+            double ang = (2.0 * Math.PI / len) * (invert ? -1 : 1);
+            double wr = Math.cos(ang);
+            double wi = Math.sin(ang);
+            for (int i = 0; i < n; i += len) {
+                double curWr = 1.0, curWi = 0.0;
+                for (int j = 0; j < len / 2; j++) {
+                    double ur = re[i + j], ui = im[i + j];
+                    double vr = re[i + j + len / 2] * curWr - im[i + j + len / 2] * curWi;
+                    double vi = re[i + j + len / 2] * curWi + im[i + j + len / 2] * curWr;
+                    re[i + j] = ur + vr;
+                    im[i + j] = ui + vi;
+                    re[i + j + len / 2] = ur - vr;
+                    im[i + j + len / 2] = ui - vi;
+                    double nWr = curWr * wr - curWi * wi;
+                    double nWi = curWr * wi + curWi * wr;
+                    curWr = nWr;
+                    curWi = nWi;
+                }
+            }
+        }
+        if (invert) {
+            for (int i = 0; i < n; i++) {
+                re[i] /= n;
+                im[i] /= n;
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Hann window — mirrors JS _hannWindow(n)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static float[] hannWindow(int n) {
+        float[] w = new float[n];
+        for (int i = 0; i < n; i++) {
+            w[i] = (float) (0.5 - 0.5 * Math.cos(2.0 * Math.PI * i / (n - 1)));
+        }
+        return w;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bark-band mapping — mirrors JS _hzToBark and _buildBinToBandMap
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static double hzToBark(double hz) {
+        return 13.0 * Math.atan(0.00076 * hz) + 3.5 * Math.atan(Math.pow(hz / 7500.0, 2));
+    }
+
+    private static int[] buildBinToBandMap(int n, float sampleRate, int numBands) {
+        int[] map = new int[n];
+        double nyquistBark = hzToBark(sampleRate / 2.0);
+        for (int k = 0; k < n; k++) {
+            double hz = (double) k * sampleRate / n;
+            double bark = hzToBark(hz);
+            int band = (int) Math.floor((bark / nyquistBark) * numBands);
+            if (band >= numBands) band = numBands - 1;
+            if (band < 0) band = 0;
+            map[k] = band;
+        }
+        return map;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Audio decoding — reads sample rate from the WAV header
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Holds decoded audio samples and the source sample rate. */
+    private static class DecodedAudio {
+        final float[] samples;
+        final float sampleRate;
+        DecodedAudio(float[] samples, float sampleRate) {
+            this.samples = samples;
+            this.sampleRate = sampleRate;
+        }
+    }
+
+    /**
+     * Decode the uploaded audio file to normalised float32 samples in [-1, +1].
+     * Also extracts the sample rate from the audio header.
+     */
+    private DecodedAudio decodeAudioToFloatSamples(MultipartFile audioFile)
             throws IOException, UnsupportedAudioFileException {
 
         byte[] fileBytes = audioFile.getBytes();
@@ -153,40 +388,35 @@ public class WatermarkDetectionService {
                 new BufferedInputStream(new ByteArrayInputStream(fileBytes)))) {
 
             AudioFormat src = ais.getFormat();
+            float sampleRate = src.getSampleRate();
 
             // Target: 16-bit signed mono little-endian PCM
-            // bigEndian = true means BIG-endian in Java AudioFormat
-            // bigEndian = false means LITTLE-endian — matches pcmBytesToFloats()
             AudioFormat pcmFormat = new AudioFormat(
                     AudioFormat.Encoding.PCM_SIGNED,
-                    src.getSampleRate(),
+                    sampleRate,
                     16,
-                    1, // mono
-                    2, // 2 bytes per frame
-                    src.getSampleRate(),
-                    false); // little-endian
+                    1,       // mono
+                    2,       // 2 bytes per frame
+                    sampleRate,
+                    false);  // little-endian
 
             try (AudioInputStream pcm = AudioSystem.getAudioInputStream(pcmFormat, ais)) {
-                return pcmBytesToFloats(pcm.readAllBytes());
+                return new DecodedAudio(pcmBytesToFloats(pcm.readAllBytes()), sampleRate);
             }
 
         } catch (UnsupportedAudioFileException e) {
-            // Fallback for containers AudioSystem cannot open natively
-            return pcmBytesToFloats(fileBytes);
+            // Fallback: assume raw 16-bit PCM at 48000 Hz
+            return new DecodedAudio(pcmBytesToFloats(fileBytes), 48000f);
         }
     }
 
     /**
      * Convert raw 16-bit little-endian signed PCM bytes to float32 in [-1, +1].
-     * Matches the inverse of JS encodeWAV():
-     * positive sample: encoded as s * 0x7FFF, decoded as val / 32768
-     * negative sample: encoded as s * 0x8000, decoded as val / 32768
      */
     private float[] pcmBytesToFloats(byte[] bytes) {
         int n = bytes.length / 2;
         float[] out = new float[n];
         for (int i = 0; i < n; i++) {
-            // Little-endian: low byte first, high byte second
             short s = (short) ((bytes[2 * i + 1] << 8) | (bytes[2 * i] & 0xFF));
             out[i] = s / 32768.0f;
         }
@@ -194,71 +424,13 @@ public class WatermarkDetectionService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Framing
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Slice samples into non-overlapping frames of frameSize.
-     * Trailing samples that don't fill a complete frame are discarded,
-     * matching the worklet's ring-buffer behaviour.
-     */
-    private List<float[]> segmentIntoFrames(float[] samples, int frameSize) {
-        List<float[]> frames = new ArrayList<>();
-        for (int off = 0; off + frameSize <= samples.length; off += frameSize)
-            frames.add(Arrays.copyOfRange(samples, off, off + frameSize));
-        return frames;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Correlation — mirrors JS correlate(frame, pn) = Σ frame[i] * pn[i]
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private double computeAverageCorrelation(List<float[]> frames, String seed, int frameSize) {
-        float[] pn = generatePN(seed, frameSize);
-        double total = 0.0;
-        for (float[] frame : frames) {
-            double c = 0.0;
-            for (int i = 0; i < frameSize; i++)
-                c += frame[i] * pn[i];
-            total += c;
-        }
-        return frames.isEmpty() ? 0.0 : total / frames.size();
-    }
-
-    private double computePnPower(float[] pn) {
-        double sum = 0.0;
-        for (float v : pn)
-            sum += (double) v * v;
-        return sum / pn.length;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // PN generation — exact Java port of the front-end JS
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Mirrors JS generatePN(seed, length):
-     * if (typeof seed === "string") numericSeed = hashString(seed)
-     * else numericSeed = seed >>> 0
-     * chips[i] = rand() * 2 − 1
-     *
-     * The seed stored in the DB is always a String (e.g. "A7F3K9").
-     * Non-numeric strings go through djb2 hashString().
-     * Purely numeric strings (e.g. "42") are treated as raw unsigned 32-bit
-     * integers, matching the JS `seed >>> 0` path for numeric seeds.
-     */
-    private float[] generatePN(String seed, int length) {
-        long[] state = { resolveSeed(seed) };
-        float[] pn = new float[length];
-        for (int i = 0; i < length; i++)
-            pn[i] = (float) (mulberry32Next(state) * 2.0 - 1.0);
-        return pn;
-    }
-
-    /**
      * Resolve a seed string to an unsigned 32-bit long, exactly as JS does:
      * numeric string → parseInt(seed) & 0xFFFFFFFF (mirrors seed >>> 0)
-     * other string → djb2 hashString(seed)
+     * other string   → djb2 hashString(seed)
      */
     private long resolveSeed(String seed) {
         try {
@@ -278,12 +450,7 @@ public class WatermarkDetectionService {
     }
 
     /**
-     * One step of mulberry32 — exact port of JS mulberry32():
-     * s += 0x6d2b79f5;
-     * let t = Math.imul(s ^ (s >>> 15), 1 | s);
-     * t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-     * return ((t ^ (t >>> 14)) >>> 0) / 0x100000000;
-     *
+     * One step of mulberry32 — exact port of JS mulberry32().
      * All values kept as unsigned 32-bit via masking with 0xFFFFFFFFL.
      */
     private double mulberry32Next(long[] state) {
@@ -297,7 +464,6 @@ public class WatermarkDetectionService {
 
     /**
      * Unsigned 32-bit multiply — mirrors JS Math.imul().
-     * Keeps only the lower 32 bits of the product.
      */
     private long imul32(long a, long b) {
         return (a & 0xFFFFFFFFL) * (b & 0xFFFFFFFFL) & 0xFFFFFFFFL;
