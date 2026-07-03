@@ -28,19 +28,79 @@ import java.util.*;
  *       - Compute spectral correlation between audio and PN spectra.
  *    c. Average the per-frame spectral correlations.
  * 4. The user with the highest average correlation is the best candidate.
- * 
- * PN generation exactly mirrors JS generatePN() in the audio worklet:
- * - Non-numeric string seed → djb2 hashString() → mulberry32
- * - Numeric string seed → raw integer → mulberry32
+ *
+ * PN generation exactly mirrors JS generatePN() / the worklet constructor:
+ * - ALL string seeds (numeric-looking or not) → djb2 hashString() → mulberry32.
+ *   The JS worklet has no "numeric string -> raw integer" branch; it always
+ *   hashes string seeds. The detector must do the same or it will derive a
+ *   completely different PRNG stream for any user whose seed happens to be
+ *   a numeric string, causing that user's true correlation to collapse to
+ *   noise and a different (wrong) user to be reported as the match.
  * - Chips: rand() * 2 − 1 (continuous float, not binary ±1)
  *
  * FFT, Hann window, and Bark-band mapping are ported from the JS worklet.
+ *
+ * FIDELITY NOTE: the embedder does NOT add the shaped PN spectrum to the
+ * audio in the frequency domain. For each hop it inverse-FFTs the shaped PN
+ * back to the time domain, re-windows it, overlap-adds it into an
+ * accumulator across consecutive frames, and only then adds the accumulated
+ * time-domain signal to the original audio (with clipping) to produce the
+ * output. This detector mirrors that synthesis exactly: for each candidate
+ * seed it reconstructs a full-length, watermark-only "predicted" time-domain
+ * track via the same masking-threshold shaping -> IFFT -> re-window ->
+ * overlap-add pipeline, then computes a normalised time-domain cross
+ * correlation between that reconstruction and the actual recorded audio.
+ * Because the PN sequence is noise-like, only the correct seed's
+ * reconstruction lines up with what's actually embedded in the recording;
+ * an unrelated seed's reconstruction is close to uncorrelated with it, and
+ * the underlying speech is uncorrelated with either.
+ *
+ * WARM-UP NOTE: the embedder's analysis buffer starts zero-filled
+ * (this._analysisBuf = new Float32Array(analysisSize)) and slides left by
+ * one hop per frame, so the very first frame or two analyse a window that
+ * is partly zeros. The detector reproduces that exact sliding/zero-padded
+ * buffer (see `analysisBuf` below) instead of reading raw
+ * samples[off..off+analysisSize-1] directly, which previously desynchronised
+ * the streaming PRNG from the audio content by roughly one frame and
+ * collapsed correlation to noise.
  */
 @Service
 public class WatermarkDetectionService {
 
-    /** Minimum correlation to declare detection (empirically tuned). */
-    private static final double DETECTION_THRESHOLD = -1000;
+    /**
+     * Minimum whole-recording normalised correlation to declare detection.
+     *
+     * IMPORTANT — CALIBRATION: this score is a whole-recording time-domain
+     * cross-correlation (see computeWatermarkCorrelation), which for this
+     * watermarking scheme tops out well below 1.0 even for a correct match —
+     * the watermark is deliberately shaped to sit at/under the psychoacoustic
+     * masking threshold, so its energy relative to the underlying speech is
+     * small by design. Observed real correlations for a correct match on
+     * this pipeline have been in the ~0.02–0.03 range, with incorrect
+     * candidates scoring negative or near-zero. A threshold of 0.15 (an
+     * earlier placeholder) was far too high and caused true positives to be
+     * reported as "not detected".
+     *
+     * 0.015 below is a reasonable starting point given observed data, but
+     * you should still calibrate this against a larger set of known-good /
+     * known-bad recordings for your specific alpha/frameSize/analysisWindow
+     * settings, since the achievable correlation scales with the watermark
+     * strength (alpha) you embed with.
+     */
+    private static final double DETECTION_THRESHOLD = 0.015;
+
+    /**
+     * Minimum gap between the best and second-best score required to trust
+     * the winner. Without this, two close/noisy scores can flip the
+     * "detected" user essentially at random. Lowered alongside
+     * DETECTION_THRESHOLD to match the real achievable correlation scale —
+     * an earlier value of 0.05 was larger than most real winning margins on
+     * this pipeline (e.g. an observed correct-match margin of ~0.044 would
+     * have only barely cleared it, and smaller-but-still-real margins would
+     * not have). Tune this together with DETECTION_THRESHOLD against real
+     * data.
+     */
+    private static final double MIN_SCORE_MARGIN = 0.01;
 
     @Autowired
     private WatermarkConfigRepository repository;
@@ -87,19 +147,17 @@ public class WatermarkDetectionService {
         float[] window = hannWindow(analysisSize);
         int[] binToBand = buildBinToBandMap(analysisSize, sampleRate, numBands);
 
-        // Number of hop-aligned frames
+        // Number of frames — one per hop, matching the embedder which processes
+        // one hop of new audio per frame (with a sliding analysis window).
         int hop = frameSize;
-        int numFrames = 0;
-        for (int off = 0; off + analysisSize <= samples.length; off += hop) {
-            numFrames++;
-        }
+        int numFrames = samples.length / hop;
 
         if (numFrames == 0) {
             return new WatermarkDetectionResponse(
                     null, null, sessionId, 0.0, false, 0, sessionConfigs.size(),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
-                    "Audio too short for detection (need at least " + analysisSize + " samples).");
+                    "Audio too short for detection (need at least " + hop + " samples).");
         }
 
         // ── 3. Score each user using spectral correlation ───────────────────
@@ -107,25 +165,35 @@ public class WatermarkDetectionService {
         Map<String, String> userDisplayNames = new LinkedHashMap<>();
 
         for (WatermarkConfigRepository.DetectionConfigProjection config : sessionConfigs) {
-            double score = computeSpectralCorrelation(
+            double score = computeWatermarkCorrelation(
                     samples, config.getSeed(), hop, analysisSize, numBands,
                     sampleRate, window, binToBand, config.getAlpha());
             allUserScores.put(config.getUserId(), round4(score));
             userDisplayNames.put(config.getUserId(), config.getDisplayName());
         }
 
-        // ── 4. Find the user with the highest score ─────────────────────────
+        // ── 4. Find the user with the highest score, and the runner-up ──────
         String bestUserId = null;
         double bestScore = Double.NEGATIVE_INFINITY;
+        double secondBestScore = Double.NEGATIVE_INFINITY;
         for (Map.Entry<String, Double> entry : allUserScores.entrySet()) {
-            if (entry.getValue() > bestScore) {
-                bestScore = entry.getValue();
+            double v = entry.getValue();
+            if (v > bestScore) {
+                secondBestScore = bestScore;
+                bestScore = v;
                 bestUserId = entry.getKey();
+            } else if (v > secondBestScore) {
+                secondBestScore = v;
             }
         }
+        if (secondBestScore == Double.NEGATIVE_INFINITY) {
+            // Only one candidate existed - no margin to compare against.
+            secondBestScore = bestScore;
+        }
 
-        // ── 5. Apply detection threshold ────────────────────────────────────
-        boolean detected = bestScore >= DETECTION_THRESHOLD;
+        // ── 5. Apply detection threshold + minimum margin over runner-up ────
+        boolean detected = bestScore >= DETECTION_THRESHOLD
+                && (bestScore - secondBestScore) >= MIN_SCORE_MARGIN;
 
         final String finalBestUser = bestUserId;
         WatermarkConfigRepository.DetectionConfigProjection winnerConfig = sessionConfigs.stream()
@@ -135,11 +203,11 @@ public class WatermarkDetectionService {
 
         String message = detected
                 ? String.format(
-                        "Watermark detected. Detected user: '%s' | score=%.6f",
-                        winnerConfig.getDisplayName(), bestScore)
+                        "Watermark detected. Detected user: '%s' | score=%.6f (margin over runner-up=%.6f)",
+                        winnerConfig.getDisplayName(), bestScore, bestScore - secondBestScore)
                 : String.format(
-                        "No watermark detected. Highest score: %.6f for user '%s'",
-                        bestScore, winnerConfig.getDisplayName());
+                        "No watermark detected. Highest score: %.6f for user '%s' (margin over runner-up=%.6f)",
+                        bestScore, winnerConfig.getDisplayName(), bestScore - secondBestScore);
 
         return new WatermarkDetectionResponse(
                 detected ? winnerConfig.getUserId() : null,
@@ -155,19 +223,27 @@ public class WatermarkDetectionService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Spectral correlation — mirrors the embedder pipeline
+    // Watermark reconstruction + correlation — mirrors the embedder pipeline
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Compute the average spectral correlation between the audio and the
-     * watermark that would have been embedded by the given seed.
+     * Reconstruct the full-length, watermark-only time-domain signal that the
+     * given seed would have produced (via the same masking-threshold shaping,
+     * inverse FFT, re-windowing, and overlap-add the embedder uses), then
+     * return the normalised time-domain cross-correlation between that
+     * reconstruction and the actual recorded audio.
      *
-     * This mirrors the embedder exactly:
-     * - A streaming PRNG is created from the seed.
-     * - For each hop-aligned frame, analysisSize PN values are consumed
-     *   (same as the embedder), FFTed, and correlated against the audio spectrum.
+     * The masking threshold for each frame is still derived from the actual
+     * recorded audio's spectrum (same as the embedder would have derived it
+     * from the original audio at embed time — this is a reasonable
+     * approximation since the watermark's own energy is small relative to the
+     * underlying speech/audio it's masked against). What changes vs. a naive
+     * frequency-domain comparison is that the shaped PN is carried all the way
+     * through IFFT -> re-window -> overlap-add into a real time-domain
+     * reconstruction, exactly mirroring what the embedder actually wrote into
+     * the recording, before scoring.
      */
-    private double computeSpectralCorrelation(
+    private double computeWatermarkCorrelation(
             float[] samples, String seed, int hop, int analysisSize,
             int numBands, float sampleRate, float[] window, int[] binToBand, double alpha) {
 
@@ -187,14 +263,43 @@ public class WatermarkDetectionService {
         double[] bandCount = new double[numBands];
         double[] bandFlatness = new double[numBands];
         double[] bandThreshold = new double[numBands];
+        double[] spreadThreshold = new double[numBands];
 
-        double totalCorrelation = 0.0;
-        int numFrames = 0;
+        // Full-length reconstruction buffer: the predicted watermark-only
+        // signal this seed would have produced, built via overlap-add across
+        // all frames (mirrors this._olaAcc accumulation in the JS worklet,
+        // but computed offline over the whole recording at once).
+        double[] recon = new double[samples.length];
 
-        for (int off = 0; off + analysisSize <= samples.length; off += hop) {
-            // ── 1. Window the audio ─────────────────────────────────────────
+        // Sliding analysis buffer — starts zero-filled to mirror the embedder's
+        // constructor: this._analysisBuf = new Float32Array(analysisSize).
+        // The embedder slides this buffer left by one hop per frame and fills
+        // the tail with new samples, so the very first frame analyses a window
+        // that is mostly zeros. Reading raw samples[off..off+analysisSize-1]
+        // directly (an earlier approach) desynchronised the streaming PRNG
+        // from the audio content by roughly one frame and collapsed the
+        // correlation to noise.
+        double[] analysisBuf = new double[analysisSize];
+
+        int numDetectorFrames = samples.length / hop;
+        for (int f = 0; f < numDetectorFrames; f++) {
+            int off = f * hop;
+
+            // Slide analysis buffer left by hop, insert new samples at end
+            // (mirrors: this._analysisBuf.copyWithin(0, hop);
+            //          this._analysisBuf.set(samples, N - hop);)
+            System.arraycopy(analysisBuf, hop, analysisBuf, 0, analysisSize - hop);
+            int copyCount = Math.min(hop, samples.length - off);
+            for (int i = 0; i < copyCount; i++) {
+                analysisBuf[analysisSize - hop + i] = samples[off + i];
+            }
+            for (int i = copyCount; i < hop; i++) {
+                analysisBuf[analysisSize - hop + i] = 0.0;
+            }
+
+            // ── 1. Window the analysis buffer (for masking-threshold analysis)
             for (int i = 0; i < analysisSize; i++) {
-                audioRe[i] = samples[off + i] * window[i];
+                audioRe[i] = analysisBuf[i] * window[i];
                 audioIm[i] = 0.0;
             }
             fft(audioRe, audioIm, false);
@@ -225,10 +330,13 @@ public class WatermarkDetectionService {
                 double energyDb = 10.0 * Math.log10(bandEnergy[b] + 1e-12);
                 bandThreshold[b] = Math.pow(10.0, (energyDb - offsetDb) / 10.0);
             }
-            // 3-tap spreading
-            double[] spreadThreshold = Arrays.copyOf(bandThreshold, numBands);
+            // 3-tap spreading — mirrors the JS worklet's IN-PLACE cascading
+            // update exactly: JS overwrites this._bandThreshold[b] before
+            // reading it as "left" for band b+1, so this is a left-to-right
+            // cascading filter, not a symmetric spread from the original
+            // (unmodified) array. Reproduce that same order here.
             for (int b = 0; b < numBands; b++) {
-                double left = b > 0 ? bandThreshold[b - 1] : bandThreshold[b];
+                double left = b > 0 ? spreadThreshold[b - 1] : bandThreshold[b];
                 double right = b < numBands - 1 ? bandThreshold[b + 1] : bandThreshold[b];
                 spreadThreshold[b] = 0.5 * bandThreshold[b] + 0.25 * left + 0.25 * right;
             }
@@ -252,26 +360,37 @@ public class WatermarkDetectionService {
                 pnIm[mirror] = -pnIm[k];
             }
 
-            // ── 6. Spectral correlation ─────────────────────────────────────
-            // Correlation = Σ Re(audio) * Re(pn) + Im(audio) * Im(pn)
-            // over positive frequencies, normalised
-            double corr = 0.0;
-            double audioPower = 0.0;
-            double pnPower = 0.0;
-            for (int k = 1; k < analysisSize / 2; k++) {
-                corr += audioRe[k] * pnRe[k] + audioIm[k] * pnIm[k];
-                audioPower += audioRe[k] * audioRe[k] + audioIm[k] * audioIm[k];
-                pnPower += pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k];
+            // ── 6. Inverse FFT back to time domain, then re-window ──────────
+            // Mirrors: _fft(pnRe, pnIm, true) followed by pnRe[i] *= window[i]
+            fft(pnRe, pnIm, true);
+            for (int i = 0; i < analysisSize; i++) {
+                pnRe[i] *= window[i];
             }
-            // Normalised correlation coefficient
-            double denom = Math.sqrt(audioPower * pnPower);
-            double normCorr = denom > 1e-12 ? corr / denom : 0.0;
 
-            totalCorrelation += normCorr;
-            numFrames++;
+            // ── 7. Overlap-add this frame's time-domain contribution into
+            //      the full-length reconstruction, positioned at this frame's
+            //      offset — mirrors this._olaAcc[i] += pnRe[i] in the worklet,
+            //      unrolled across the whole recording instead of a rolling
+            //      hop-sized buffer.
+            for (int i = 0; i < analysisSize && (off + i) < recon.length; i++) {
+                recon[off + i] += pnRe[i];
+            }
         }
 
-        return numFrames > 0 ? totalCorrelation / numFrames : 0.0;
+        // ── 8. Normalised time-domain cross-correlation between the
+        //      reconstructed watermark-only track and the actual recording.
+        double corr = 0.0;
+        double reconPower = 0.0;
+        double audioPower = 0.0;
+        for (int i = 0; i < samples.length; i++) {
+            double a = samples[i];
+            double r = recon[i];
+            corr += a * r;
+            reconPower += r * r;
+            audioPower += a * a;
+        }
+        double denom = Math.sqrt(reconPower * audioPower);
+        return denom > 1e-12 ? corr / denom : 0.0;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -427,17 +546,23 @@ public class WatermarkDetectionService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Resolve a seed string to an unsigned 32-bit long, exactly as JS does:
-     * numeric string → parseInt(seed) & 0xFFFFFFFF (mirrors seed >>> 0)
-     * other string   → djb2 hashString(seed)
+     * Resolve a seed string to an unsigned 32-bit long, exactly as the JS
+     * worklet does. IMPORTANT: the JS worklet (_createMulberry32 usage in
+     * the constructor and _generatePN) ALWAYS hashes string seeds via
+     * _hashString — there is no "numeric string -> parse as raw integer"
+     * branch on the JS side. A seed is only used as a raw integer when it is
+     * an actual JS number (seed >>> 0), never when it's a string, even if
+     * that string looks numeric (e.g. "1001").
+     *
+     * An earlier version of this method special-cased numeric-looking
+     * strings and used them as raw integers, which diverges from the
+     * embedder's PRNG stream for any user whose stored seed happens to be a
+     * numeric string, causing that user's watermark to go undetected and a
+     * different user to be reported as the match instead. Since seeds
+     * arriving here are always strings (from the DB / repository), they must
+     * always be hashed.
      */
     private long resolveSeed(String seed) {
-        try {
-            long v = Long.parseLong(seed);
-            if (v >= 0 && v <= 0xFFFFFFFFL)
-                return v & 0xFFFFFFFFL;
-        } catch (NumberFormatException ignored) {
-        }
         return hashString(seed);
     }
 
