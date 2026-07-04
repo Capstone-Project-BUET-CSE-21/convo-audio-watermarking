@@ -86,31 +86,24 @@ public class WatermarkDetectionService {
      * normalised correlations (see computeWatermarkCorrelation's scoring
      * step), not a single whole-recording correlation. This is a different
      * scale than either of the two previous scoring approaches used in
-     * earlier revisions of this file.
-     *
-     * First real controlled data point (single speaker, known talker,
-     * ~12000 frames): correct match scored 0.0059, wrong candidate scored
-     * -0.0009, margin 0.0068. 0.003 below is set comfortably below that
-     * observed correct-match score, but this is still only ONE data point.
-     * Keep collecting known-good / known-bad recordings (varying speaker,
-     * alpha, and length) and tighten this as more data comes in — a single
-     * sample is not enough to be confident this generalises.
+     * earlier revisions of this file, and has not yet been calibrated
+     * against real known-good / known-bad recordings. Treat 0.015 below as
+     * a placeholder only — re-run known-good and known-bad test recordings
+     * with this scoring method and set both thresholds from that data
+     * before relying on this in production.
      */
-    private static final double DETECTION_THRESHOLD = 0.003;
+    private static final double DETECTION_THRESHOLD = 0.015;
 
     /**
      * Minimum gap between the best and second-best score required to trust
      * the winner. Without this, two close/noisy scores can flip the
-     * "detected" user essentially at random.
-     *
-     * Set from the same first data point: observed correct-match margin was
-     * 0.0068. 0.003 below is set comfortably below that, but — as with
-     * DETECTION_THRESHOLD — this needs more known-good/known-bad samples
-     * before it should be trusted as a stable production value, especially
-     * for the harder uneven-talk-time multi-speaker case, which has not yet
-     * been validated with this scoring approach.
+     * "detected" user essentially at random. Like DETECTION_THRESHOLD, this
+     * needs fresh calibration against the new per-frame normalised scoring
+     * approach — the value below is a placeholder carried over from a
+     * previous (now-replaced) scoring method and should not be trusted
+     * without re-validating against real data.
      */
-    private static final double MIN_SCORE_MARGIN = 0.003;
+    private static final double MIN_SCORE_MARGIN = 0.01;
 
     @Autowired
     private WatermarkConfigRepository repository;
