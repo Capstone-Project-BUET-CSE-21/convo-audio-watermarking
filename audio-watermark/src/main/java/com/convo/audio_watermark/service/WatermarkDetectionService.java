@@ -48,12 +48,24 @@ import java.util.*;
  * output. This detector mirrors that synthesis exactly: for each candidate
  * seed it reconstructs a full-length, watermark-only "predicted" time-domain
  * track via the same masking-threshold shaping -> IFFT -> re-window ->
- * overlap-add pipeline, then computes a normalised time-domain cross
- * correlation between that reconstruction and the actual recorded audio.
- * Because the PN sequence is noise-like, only the correct seed's
- * reconstruction lines up with what's actually embedded in the recording;
- * an unrelated seed's reconstruction is close to uncorrelated with it, and
- * the underlying speech is uncorrelated with either.
+ * overlap-add pipeline.
+ *
+ * SCORING NOTE: the reconstruction is scored PER-FRAME, not as one global
+ * whole-recording correlation. The masking-threshold shaping is derived
+ * from the real audio's local energy, not from the seed, so EVERY
+ * candidate's reconstruction — right seed or wrong — ends up louder exactly
+ * when the real audio is louder and quieter when it's quiet. A single
+ * global correlation would pick up on that shared loudness envelope as if
+ * it were a real match, inflating every candidate's score together and
+ * shrinking the gap between right and wrong as the watermark strength
+ * (alpha) increases. Normalising each frame by its own local energy before
+ * averaging removes that shared envelope, since only the fine-grained
+ * SHAPE of the match within each frame contributes — not how loud that
+ * moment happened to be. Because the PN sequence is noise-like, only the
+ * correct seed's reconstruction lines up with what's actually embedded in
+ * the recording on a frame-by-frame basis; an unrelated seed's normalised
+ * correlation bounces around zero, and the underlying speech is
+ * uncorrelated with either.
  *
  * WARM-UP NOTE: the embedder's analysis buffer starts zero-filled
  * (this._analysisBuf = new Float32Array(analysisSize)) and slides left by
@@ -68,37 +80,28 @@ import java.util.*;
 public class WatermarkDetectionService {
 
     /**
-     * Minimum whole-recording normalised correlation to declare detection.
+     * Minimum average per-frame normalised correlation to declare detection.
      *
-     * IMPORTANT — CALIBRATION: this score is a whole-recording time-domain
-     * cross-correlation (see computeWatermarkCorrelation), which for this
-     * watermarking scheme tops out well below 1.0 even for a correct match —
-     * the watermark is deliberately shaped to sit at/under the psychoacoustic
-     * masking threshold, so its energy relative to the underlying speech is
-     * small by design. Observed real correlations for a correct match on
-     * this pipeline have been in the ~0.02–0.03 range, with incorrect
-     * candidates scoring negative or near-zero. A threshold of 0.15 (an
-     * earlier placeholder) was far too high and caused true positives to be
-     * reported as "not detected".
-     *
-     * 0.015 below is a reasonable starting point given observed data, but
-     * you should still calibrate this against a larger set of known-good /
-     * known-bad recordings for your specific alpha/frameSize/analysisWindow
-     * settings, since the achievable correlation scales with the watermark
-     * strength (alpha) you embed with.
+     * IMPORTANT — CALIBRATION: this score is now the average of PER-FRAME
+     * normalised correlations (see computeWatermarkCorrelation's scoring
+     * step), not a single whole-recording correlation. This is a different
+     * scale than either of the two previous scoring approaches used in
+     * earlier revisions of this file, and has not yet been calibrated
+     * against real known-good / known-bad recordings. Treat 0.015 below as
+     * a placeholder only — re-run known-good and known-bad test recordings
+     * with this scoring method and set both thresholds from that data
+     * before relying on this in production.
      */
     private static final double DETECTION_THRESHOLD = 0.015;
 
     /**
      * Minimum gap between the best and second-best score required to trust
      * the winner. Without this, two close/noisy scores can flip the
-     * "detected" user essentially at random. Lowered alongside
-     * DETECTION_THRESHOLD to match the real achievable correlation scale —
-     * an earlier value of 0.05 was larger than most real winning margins on
-     * this pipeline (e.g. an observed correct-match margin of ~0.044 would
-     * have only barely cleared it, and smaller-but-still-real margins would
-     * not have). Tune this together with DETECTION_THRESHOLD against real
-     * data.
+     * "detected" user essentially at random. Like DETECTION_THRESHOLD, this
+     * needs fresh calibration against the new per-frame normalised scoring
+     * approach — the value below is a placeholder carried over from a
+     * previous (now-replaced) scoring method and should not be trusted
+     * without re-validating against real data.
      */
     private static final double MIN_SCORE_MARGIN = 0.01;
 
@@ -230,8 +233,8 @@ public class WatermarkDetectionService {
      * Reconstruct the full-length, watermark-only time-domain signal that the
      * given seed would have produced (via the same masking-threshold shaping,
      * inverse FFT, re-windowing, and overlap-add the embedder uses), then
-     * return the normalised time-domain cross-correlation between that
-     * reconstruction and the actual recorded audio.
+     * score it against the actual recorded audio via PER-FRAME normalised
+     * cross-correlation, averaged across frames.
      *
      * The masking threshold for each frame is still derived from the actual
      * recorded audio's spectrum (same as the embedder would have derived it
@@ -242,6 +245,14 @@ public class WatermarkDetectionService {
      * through IFFT -> re-window -> overlap-add into a real time-domain
      * reconstruction, exactly mirroring what the embedder actually wrote into
      * the recording, before scoring.
+     *
+     * Scoring is done per-frame (not as one global whole-recording
+     * correlation) because the masking-driven shaping makes every
+     * candidate's reconstruction louder exactly when the real audio is
+     * louder, regardless of whether the seed is correct. A global
+     * correlation would pick up on that shared loudness envelope as a false
+     * signal; normalising each frame by its own local energy before
+     * averaging isolates the actual noise-pattern match instead.
      */
     private double computeWatermarkCorrelation(
             float[] samples, String seed, int hop, int analysisSize,
@@ -377,20 +388,49 @@ public class WatermarkDetectionService {
             }
         }
 
-        // ── 8. Normalised time-domain cross-correlation between the
-        //      reconstructed watermark-only track and the actual recording.
-        double corr = 0.0;
-        double reconPower = 0.0;
-        double audioPower = 0.0;
-        for (int i = 0; i < samples.length; i++) {
-            double a = samples[i];
-            double r = recon[i];
-            corr += a * r;
-            reconPower += r * r;
-            audioPower += a * a;
+        // ── 8. Per-frame normalised correlation, averaged across frames ─────
+        // A single global correlation over the whole recording is vulnerable
+        // to a shared "envelope" artifact: the masking-threshold shaping in
+        // steps 3-5 scales the reconstructed watermark's amplitude based on
+        // the REAL audio's local energy, not on the seed. That means EVERY
+        // candidate's reconstruction — right seed or wrong — gets louder
+        // exactly when the real audio gets louder, and quieter when it's
+        // quiet. A global sum-of-products correlation picks up on that
+        // shared loud/quiet pattern as if it were a real match, regardless
+        // of whether the underlying fine-grained noise content actually
+        // lines up. As alpha increases this effect inflates every
+        // candidate's score together, which is why raising alpha widened
+        // scores overall without widening the gap between right and wrong.
+        //
+        // Scoring per-frame and normalising each frame by its own local
+        // energy (both audio and reconstruction) removes this: each frame's
+        // contribution reflects only the SHAPE of the match at that moment,
+        // independent of how loud that moment happened to be. A true seed
+        // match stays positive fairly consistently frame-to-frame; an
+        // unrelated seed's normalised correlation bounces around zero.
+        // Frames with negligible energy (near-silence) are skipped, since a
+        // normalised correlation is meaningless/unstable there.
+        double totalNormCorr = 0.0;
+        int scoredFrames = 0;
+        for (int f = 0; f < numDetectorFrames; f++) {
+            int off = f * hop;
+            double corr = 0.0;
+            double audioPower = 0.0;
+            double reconPower = 0.0;
+            for (int i = 0; i < hop; i++) {
+                double a = samples[off + i];
+                double r = recon[off + i];
+                corr += a * r;
+                audioPower += a * a;
+                reconPower += r * r;
+            }
+            double denom = Math.sqrt(audioPower * reconPower);
+            if (denom > 1e-9) {
+                totalNormCorr += corr / denom;
+                scoredFrames++;
+            }
         }
-        double denom = Math.sqrt(reconPower * audioPower);
-        return denom > 1e-12 ? corr / denom : 0.0;
+        return scoredFrames > 0 ? totalNormCorr / scoredFrames : 0.0;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
