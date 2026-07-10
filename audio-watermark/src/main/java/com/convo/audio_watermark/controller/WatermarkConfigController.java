@@ -2,7 +2,6 @@ package com.convo.audio_watermark.controller;
 
 import com.convo.audio_watermark.entity.WatermarkConfig;
 import com.convo.audio_watermark.service.WatermarkConfigService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.Map;
@@ -11,8 +10,11 @@ import java.util.Map;
 @RequestMapping("/api/watermark")
 public class WatermarkConfigController {
 
-    @Autowired
-    private WatermarkConfigService service;
+    private final WatermarkConfigService service;
+
+    public WatermarkConfigController(WatermarkConfigService service) {
+        this.service = service;
+    }
 
     @GetMapping("/config")
     public Map<String, Object> getConfig(

@@ -2,7 +2,6 @@ package com.convo.audio_watermark.controller;
 
 import com.convo.audio_watermark.dto.WatermarkDetectionResponse;
 import com.convo.audio_watermark.service.WatermarkDetectionService;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -39,8 +38,11 @@ import java.util.Map;
 @RequestMapping("/api/watermark")
 public class WatermarkDetectionController {
 
-    @Autowired
-    private WatermarkDetectionService detectionService;
+    private final WatermarkDetectionService detectionService;
+
+    public WatermarkDetectionController(WatermarkDetectionService detectionService) {
+        this.detectionService = detectionService;
+    }
 
     /**
      * Detect whose watermark is embedded in the uploaded audio file.
