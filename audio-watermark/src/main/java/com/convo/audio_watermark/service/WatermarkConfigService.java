@@ -3,7 +3,6 @@ package com.convo.audio_watermark.service;
 import com.convo.audio_watermark.entity.WatermarkConfig;
 import com.convo.audio_watermark.repository.WatermarkConfigRepository;
 import org.springframework.http.HttpStatus;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
@@ -15,8 +14,11 @@ import java.util.UUID;
 @Service
 public class WatermarkConfigService {
 
-    @Autowired
-    private WatermarkConfigRepository repository;
+    private final WatermarkConfigRepository repository;
+
+    public WatermarkConfigService(WatermarkConfigRepository repository) {
+        this.repository = repository;
+    }
 
     @Transactional
     public WatermarkConfig getOrCreateConfig(String roomId, String userId) {

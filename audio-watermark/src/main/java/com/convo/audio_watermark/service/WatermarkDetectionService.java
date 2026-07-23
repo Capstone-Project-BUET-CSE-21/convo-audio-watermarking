@@ -2,13 +2,16 @@ package com.convo.audio_watermark.service;
 
 import com.convo.audio_watermark.dto.WatermarkDetectionResponse;
 import com.convo.audio_watermark.repository.WatermarkConfigRepository;
-import org.springframework.beans.factory.annotation.Autowired;
+import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import javax.sound.sampled.*;
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Detects audio watermarks embedded by the front-end audio worklet.
@@ -75,6 +78,16 @@ import java.util.*;
  * samples[off..off+analysisSize-1] directly, which previously desynchronised
  * the streaming PRNG from the audio content by roughly one frame and
  * collapsed correlation to noise.
+ *
+ * AUDIO DECODING NOTE: uploaded audio is decoded in two tiers:
+ *   1. javax.sound.sampled (AudioSystem) — handles WAV/AIFF/AU natively via
+ *      the JVM, no external dependency.
+ *   2. FFmpeg fallback — for anything AudioSystem can't parse (MP3, AAC,
+ *      M4A, Opus, etc.), the uploaded bytes are written to a temp file,
+ *      transcoded to mono 48kHz PCM WAV via the `ffmpeg` binary, and the
+ *      resulting WAV is read back through the same AudioSystem path.
+ *      Requires an `ffmpeg` binary on PATH in the deployment environment
+ *      (see Dockerfile).
  */
 @Service
 public class WatermarkDetectionService {
@@ -105,8 +118,37 @@ public class WatermarkDetectionService {
      */
     private static final double MIN_SCORE_MARGIN = 0.01;
 
-    @Autowired
-    private WatermarkConfigRepository repository;
+    /** Sample rate FFmpeg resamples fallback-decoded audio to. */
+    private static final int TARGET_SAMPLE_RATE = 48000;
+
+    /** Max time to let a single ffmpeg transcode run before giving up. */
+    private static final long FFMPEG_TIMEOUT_SECONDS = 60;
+
+    private final WatermarkConfigRepository repository;
+
+    public WatermarkDetectionService(WatermarkConfigRepository repository) {
+        this.repository = repository;
+    }
+
+    /**
+     * Fail fast at startup if ffmpeg isn't available in this environment,
+     * rather than discovering it silently on the first non-WAV upload.
+     */
+    @PostConstruct
+    public void verifyFfmpegAvailable() {
+        try {
+            Process p = new ProcessBuilder("ffmpeg", "-version").start();
+            boolean finished = p.waitFor(10, TimeUnit.SECONDS);
+            if (!finished || p.exitValue() != 0) {
+                throw new IllegalStateException("ffmpeg check failed or timed out");
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "ffmpeg is not available on this system — audio decoding for non-WAV formats "
+                            + "(MP3/AAC/M4A/Opus) will fail. Ensure ffmpeg is installed in the "
+                            + "deployment environment (see Dockerfile).", e);
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Public API
@@ -520,7 +562,8 @@ public class WatermarkDetectionService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Audio decoding — reads sample rate from the WAV header
+    // Audio decoding — tries AudioSystem (WAV/AIFF/AU) first, falls back to
+    // FFmpeg for everything else (MP3, AAC, M4A, Opus, ...)
     // ─────────────────────────────────────────────────────────────────────────
 
     /** Holds decoded audio samples and the source sample rate. */
@@ -535,12 +578,28 @@ public class WatermarkDetectionService {
 
     /**
      * Decode the uploaded audio file to normalised float32 samples in [-1, +1].
-     * Also extracts the sample rate from the audio header.
+     * Tries the JVM's built-in decoding first (fast, no external process);
+     * falls back to FFmpeg for formats AudioSystem can't parse.
      */
     private DecodedAudio decodeAudioToFloatSamples(MultipartFile audioFile)
             throws IOException, UnsupportedAudioFileException {
 
         byte[] fileBytes = audioFile.getBytes();
+
+        try {
+            return decodeUsingAudioSystem(fileBytes);
+        } catch (UnsupportedAudioFileException e) {
+            return decodeUsingFfmpeg(fileBytes, audioFile.getOriginalFilename());
+        }
+    }
+
+    /**
+     * Decode via javax.sound.sampled. Handles WAV/AIFF/AU natively — no
+     * external dependency. Throws UnsupportedAudioFileException for
+     * MP3/AAC/M4A/Opus etc., which the caller catches and routes to FFmpeg.
+     */
+    private DecodedAudio decodeUsingAudioSystem(byte[] fileBytes)
+            throws IOException, UnsupportedAudioFileException {
 
         try (AudioInputStream ais = AudioSystem.getAudioInputStream(
                 new BufferedInputStream(new ByteArrayInputStream(fileBytes)))) {
@@ -561,11 +620,93 @@ public class WatermarkDetectionService {
             try (AudioInputStream pcm = AudioSystem.getAudioInputStream(pcmFormat, ais)) {
                 return new DecodedAudio(pcmBytesToFloats(pcm.readAllBytes()), sampleRate);
             }
-
-        } catch (UnsupportedAudioFileException e) {
-            // Fallback: assume raw 16-bit PCM at 48000 Hz
-            return new DecodedAudio(pcmBytesToFloats(fileBytes), 48000f);
         }
+    }
+
+    /**
+     * Fallback decoder for formats the JVM can't read natively (MP3, AAC,
+     * M4A, Opus, ...). Shells out to the `ffmpeg` binary to transcode the
+     * upload to mono 48kHz PCM WAV in a temp file, then reads that WAV back
+     * through the same AudioSystem path used for native WAV uploads.
+     *
+     * Requires an `ffmpeg` binary on PATH in the deployment environment.
+     */
+    private DecodedAudio decodeUsingFfmpeg(byte[] fileBytes, String originalFilename) throws IOException {
+
+        Path inputPath = Files.createTempFile("watermark-in-", extractExtension(originalFilename));
+        Path outputPath = Files.createTempFile("watermark-out-", ".wav");
+
+        try {
+            Files.write(inputPath, fileBytes);
+
+            List<String> command = List.of(
+                    "ffmpeg",
+                    "-y",
+                    "-i", inputPath.toString(),
+                    "-ac", "1",
+                    "-ar", String.valueOf(TARGET_SAMPLE_RATE),
+                    "-f", "wav",
+                    outputPath.toString());
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            String ffmpegOutput;
+            try (InputStream is = process.getInputStream()) {
+                ffmpegOutput = new String(is.readAllBytes());
+            }
+
+            boolean finished;
+            try {
+                finished = process.waitFor(FFMPEG_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for ffmpeg", ie);
+            }
+
+            if (!finished) {
+                process.destroyForcibly();
+                throw new IOException("ffmpeg timed out while decoding audio");
+            }
+            if (process.exitValue() != 0) {
+                throw new IOException("ffmpeg failed to decode audio (exit=" + process.exitValue()
+                        + "): " + ffmpegOutput);
+            }
+
+            byte[] wavBytes = Files.readAllBytes(outputPath);
+
+            try (AudioInputStream ais = AudioSystem.getAudioInputStream(
+                    new BufferedInputStream(new ByteArrayInputStream(wavBytes)))) {
+
+                AudioFormat src = ais.getFormat();
+                float sampleRate = src.getSampleRate();
+
+                AudioFormat pcmFormat = new AudioFormat(
+                        AudioFormat.Encoding.PCM_SIGNED,
+                        sampleRate, 16, 1, 2, sampleRate, false);
+
+                try (AudioInputStream pcm = AudioSystem.getAudioInputStream(pcmFormat, ais)) {
+                    return new DecodedAudio(pcmBytesToFloats(pcm.readAllBytes()), sampleRate);
+                }
+            } catch (UnsupportedAudioFileException uafe) {
+                // ffmpeg always writes a plain WAV here, so this shouldn't happen —
+                // fail loudly instead of silently mis-decoding.
+                throw new IOException("ffmpeg produced a WAV file that could not be read back", uafe);
+            }
+
+        } finally {
+            Files.deleteIfExists(inputPath);
+            Files.deleteIfExists(outputPath);
+        }
+    }
+
+    /** Extracts ".ext" (including dot) from a filename, defaulting to ".tmp". */
+    private String extractExtension(String originalFilename) {
+        if (originalFilename == null) return ".tmp";
+        int dot = originalFilename.lastIndexOf('.');
+        if (dot < 0 || dot == originalFilename.length() - 1) return ".tmp";
+        return originalFilename.substring(dot); // e.g. ".mp3"
     }
 
     /**

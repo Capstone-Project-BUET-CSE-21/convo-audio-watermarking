@@ -53,8 +53,7 @@ public class WatermarkDetectionController {
      */
     @PostMapping(value = "/detect", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<?> detectWatermark(
-            @RequestPart("audio") MultipartFile audioFile,
-            @RequestParam("sessionId") String sessionId) {
+            @RequestPart("audio") MultipartFile audioFile, String sessionId) {
 
         // Basic input validation
         if (audioFile == null || audioFile.isEmpty()) {
