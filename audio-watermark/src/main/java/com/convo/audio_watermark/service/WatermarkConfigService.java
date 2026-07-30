@@ -39,11 +39,19 @@ public class WatermarkConfigService {
         WatermarkConfig config = new WatermarkConfig();
         config.setMeetingUserId(meetingUserId);
         config.setSeed(generateUniqueSeed());
-        config.setAlpha(0.002);
+        config.setAlpha(4.0);
         config.setFrameSize(256);
         config.setCreatedAt(LocalDateTime.now());
         config.setAnalysisWindowSize(512); 
         config.setNumBands(24);
+        // Repeating-tag period — MUST match what audio-processor.worklet.js
+        // uses (config.cycleSeconds, defaults to 20 there too). This is what
+        // bounds the detector's search to a fixed window instead of one that
+        // grows with call length — see WatermarkDetectionService. Set with
+        // some headroom above your actual expected clip length, not longer
+        // than needed — see conversation notes on why shortening this
+        // doesn't meaningfully speed up detection (COARSE_CYCLE_CANDIDATES
+        // already auto-scales the search stride to the cycle length).
         config.setCycleSeconds(8.0);
 
         return repository.save(config);

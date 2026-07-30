@@ -262,6 +262,28 @@ public class WatermarkDetectionService {
         }
     }
 
+    /**
+     * Scratch buffers reused across every candidate evaluated in one
+     * detection request, instead of each candidate allocating (and
+     * zero-initializing) its own. With thousands of candidates tested per
+     * request, fresh allocation per call was the dominant cost — not the
+     * actual FFT/correlation work — since {@code recon} in particular can
+     * be tens of thousands of elements. Sized once to the largest frame
+     * count any stage will use (the full recording, in stage 3); earlier
+     * stages use a shorter prefix of the same buffer and clear only the
+     * region they touch.
+     */
+    private static class ScratchBuffers {
+        final double[] pnRe;
+        final double[] pnIm;
+        final double[] recon;
+        ScratchBuffers(int analysisSize, int maxReconLen) {
+            pnRe = new double[analysisSize];
+            pnIm = new double[analysisSize];
+            recon = new double[maxReconLen];
+        }
+    }
+
     private Map<String, Double> findBestScoresAcrossUsers(
             float[] samples,
             List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs,
@@ -272,6 +294,10 @@ public class WatermarkDetectionService {
         int searchFrameCount = Math.min(SEARCH_FRAME_COUNT, numDetectorFrames);
 
         int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
+
+        // Allocated ONCE for the whole request — see ScratchBuffers docs.
+        int maxReconLen = numDetectorFrames * hop + analysisSize;
+        ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
 
         Map<String, BestAlignment> bestByUser = new HashMap<>();
         Map<String, Long> hopsPerCycleByUser = new HashMap<>();
@@ -300,7 +326,7 @@ public class WatermarkDetectionService {
                 for (long cyclePos = 0; cyclePos < hopsPerCycle; cyclePos += cycleStride) {
                     double score = scoreCandidate(
                             samples, phase, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
-                            numBands, window, binToBand, framesAvailable);
+                            numBands, window, binToBand, framesAvailable, buffers);
 
                     BestAlignment ba = bestByUser.get(c.getUserId());
                     if (score > ba.score) {
@@ -334,7 +360,7 @@ public class WatermarkDetectionService {
                 for (long cyclePos = cycleLo; cyclePos <= cycleHi; cyclePos++) {
                     double score = scoreCandidate(
                             samples, phase, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
-                            numBands, window, binToBand, framesAvailable);
+                            numBands, window, binToBand, framesAvailable, buffers);
                     if (score > ba.score) {
                         ba.score = score;
                         ba.phase = phase;
@@ -361,7 +387,7 @@ public class WatermarkDetectionService {
             long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
             double score = scoreCandidate(
                     samples, ba.phase, analysis, c, ba.cyclePos, hopsPerCycle, hop, analysisSize,
-                    numBands, window, binToBand, framesAvailable);
+                    numBands, window, binToBand, framesAvailable, buffers);
 
             finalScores.put(c.getUserId(), score);
         }
@@ -372,13 +398,13 @@ public class WatermarkDetectionService {
             float[] samples, int phase, FrameAnalysis analysis,
             WatermarkConfigRepository.DetectionConfigProjection config, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
-            int frameCount) {
+            int frameCount, ScratchBuffers buffers) {
 
         long baseSeedState = resolveSeed(config.getSeed());
         double marginLinear = Math.pow(10.0, config.getAlpha() / 20.0);
         return scoreWithAnalysis(
                 samples, phase, analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
-                numBands, window, binToBand, marginLinear, frameCount);
+                numBands, window, binToBand, marginLinear, frameCount, buffers);
     }
 
     /**
@@ -516,11 +542,17 @@ public class WatermarkDetectionService {
             float[] samples, int sampleOffset, FrameAnalysis analysis,
             long baseSeedState, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
-            double marginLinear, int frameCount) {
+            double marginLinear, int frameCount, ScratchBuffers buffers) {
 
-        double[] pnRe = new double[analysisSize];
-        double[] pnIm = new double[analysisSize];
-        double[] recon = new double[frameCount * hop + analysisSize];
+        double[] pnRe = buffers.pnRe;
+        double[] pnIm = buffers.pnIm;
+        double[] recon = buffers.recon;
+        int reconLen = frameCount * hop + analysisSize;
+        // Only clear the portion this call actually uses — reused across
+        // every candidate, so stale values from a previous (possibly
+        // longer) call must not leak in, but there's no need to touch the
+        // rest of a buffer sized for the largest call this request makes.
+        Arrays.fill(recon, 0, reconLen, 0.0);
 
         for (int f = 0; f < frameCount; f++) {
             int off = f * hop;
