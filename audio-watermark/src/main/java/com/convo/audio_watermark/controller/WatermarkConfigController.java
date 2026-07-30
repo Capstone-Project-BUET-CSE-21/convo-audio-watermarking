@@ -28,6 +28,7 @@ public class WatermarkConfigController {
                 "alpha", config.getAlpha(),
                 "frameSize", config.getFrameSize(),
                 "analysisWindowSize", config.getAnalysisWindowSize(),
-                "numBands", config.getNumBands());
+                "numBands", config.getNumBands(),
+                "cycleSeconds", config.getCycleSeconds());
     }
 }

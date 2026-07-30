@@ -3,11 +3,9 @@ package com.convo.audio_watermark.repository;
 import com.convo.audio_watermark.entity.WatermarkConfig;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
-import org.springframework.stereotype.Repository;
 import java.util.List;
 import java.util.Optional;
 
-@Repository
 public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig, Long> {
     boolean existsBySeed(String seed);
 
@@ -45,6 +43,8 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
         Integer getAnalysisWindowSize();
  
         Integer getNumBands();
+
+        Double getCycleSeconds();
     }
 
     @Query(value = """
@@ -55,7 +55,8 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
                 wc.alpha as alpha,
                 wc.frame_size as frameSize,
                 wc.analysis_window_size as analysisWindowSize,
-                wc.num_bands as numBands
+                wc.num_bands as numBands,
+                wc.cycle_seconds as cycleSeconds
             from watermark_config wc
             join meeting_user mu on wc.meeting_user_id = mu.id
             join users u on mu.user_id = u.id

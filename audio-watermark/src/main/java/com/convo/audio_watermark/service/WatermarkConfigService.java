@@ -44,6 +44,7 @@ public class WatermarkConfigService {
         config.setCreatedAt(LocalDateTime.now());
         config.setAnalysisWindowSize(512); 
         config.setNumBands(24);
+        config.setCycleSeconds(8.0);
 
         return repository.save(config);
     }

@@ -27,12 +27,19 @@ public class WatermarkConfig {
     private LocalDateTime createdAt;
 
     // Width of the analysis window used for masking computation (hop * 2 for 50% overlap-add).
-    @Column(name = "analysis_window_size")
+    @Column(name = "analysis_window_size", nullable = false)
     private Integer analysisWindowSize;
  
     // Number of Bark critical bands used to compute the masking threshold.
-    @Column(name = "num_bands")
+    @Column(name = "num_bands", nullable = false)
     private Integer numBands;
+
+    // Repeating-tag period, in seconds. Must match what the embedder
+    // (audio-processor.worklet.js, config.cycleSeconds) actually used —
+    // this is what bounds the detector's synchronization search to a
+    // fixed window instead of one that grows with call length.
+    @Column(name = "cycle_seconds", nullable = false)
+    private Double cycleSeconds;
 
     // Getters and Setters
     public Long getId() {
@@ -97,5 +104,13 @@ public class WatermarkConfig {
  
     public void setNumBands(Integer numBands) {
         this.numBands = numBands;
+    }
+
+    public Double getCycleSeconds() {
+        return cycleSeconds;
+    }
+
+    public void setCycleSeconds(Double cycleSeconds) {
+        this.cycleSeconds = cycleSeconds;
     }
 }
