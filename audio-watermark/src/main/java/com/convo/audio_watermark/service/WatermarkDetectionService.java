@@ -287,20 +287,21 @@ public class WatermarkDetectionService {
     }
 
     /**
-     * Scratch buffers reused across every candidate evaluated for ONE user,
-     * instead of each candidate allocating (and zero-initializing) its own.
-     * With thousands of candidates tested per user, fresh allocation per
-     * call was the dominant cost — not the actual FFT/correlation work —
-     * since {@code recon} in particular can be tens of thousands of
-     * elements. Sized once to the largest frame count any stage will use
-     * (the full recording, in stage 3); earlier stages use a shorter
-     * prefix of the same buffer and clear only the region they touch.
+     * Scratch buffers reused across every candidate evaluated by ONE
+     * parallel task, instead of each candidate allocating (and
+     * zero-initializing) its own. With thousands of candidates tested per
+     * request, fresh allocation per call was the original bottleneck — not
+     * the actual FFT/correlation work — since {@code recon} in particular
+     * can be tens of thousands of elements.
      *
-     * ONE INSTANCE PER USER, NOT SHARED ACROSS THE REQUEST: since different
-     * users' candidates are now scored concurrently on different threads
-     * (see findBestScoresAcrossUsers), each user needs buffers no other
-     * thread touches — sharing one instance across users would let
-     * concurrent FFT calls corrupt each other's scratch arrays mid-computation.
+     * ONE INSTANCE PER TASK, NOT PER USER: search work is chunked across
+     * candidates (see findBestScoresAcrossUsers), not just across users —
+     * a single user's search can now run as several concurrent chunks on
+     * different threads, so buffers must be scoped to whichever chunk owns
+     * them, not shared per-user (that would let concurrent chunks corrupt
+     * each other's scratch arrays mid-FFT). The number of tasks is still
+     * small and bounded (phases × users × workers), so this stays far
+     * cheaper than the original per-candidate allocation.
      */
     private static class ScratchBuffers {
         final double[] pnRe;
@@ -312,6 +313,17 @@ public class WatermarkDetectionService {
             pnRe = new double[analysisSize];
             pnIm = new double[analysisSize];
             recon = new double[maxReconLen];
+        }
+    }
+
+    /** Thread-safe "keep if better" update — multiple chunks for the same user can finish concurrently. */
+    private static void updateBestAlignment(BestAlignment ba, double score, int phase, long cyclePos) {
+        synchronized (ba) {
+            if (score > ba.score) {
+                ba.score = score;
+                ba.phase = phase;
+                ba.cyclePos = cyclePos;
+            }
         }
     }
 
@@ -327,16 +339,16 @@ public class WatermarkDetectionService {
         int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
         int maxReconLen = numDetectorFrames * hop + analysisSize;
 
-        // Thread-safe maps: different users' entries are written from
-        // different worker threads below, so each user's slot must be
-        // safely publishable/visible across threads. Reads/writes to
-        // DIFFERENT keys from different threads are what ConcurrentHashMap
-        // guarantees; this code never has two threads touch the same key.
+        // How many independent chunks to split EACH user's candidate range
+        // into. This — not user count — is what determines actual core
+        // utilization: a 2-person call has only 2 independent "user" tasks
+        // to hand out, but thousands of independent candidates within each
+        // user's search, so chunking on candidates lets a small meeting
+        // still saturate a large core count.
+        int numWorkers = Math.max(1, Runtime.getRuntime().availableProcessors());
+
         Map<String, BestAlignment> bestByUser = new ConcurrentHashMap<>();
         Map<String, Long> hopsPerCycleByUser = new HashMap<>();
-        // One ScratchBuffers PER USER — required for safe concurrent
-        // scoring, see ScratchBuffers docs above.
-        Map<String, ScratchBuffers> buffersByUser = new HashMap<>();
         for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
             bestByUser.put(c.getUserId(), new BestAlignment());
             // Each user's cycle length in hops — MUST match what their
@@ -344,17 +356,15 @@ public class WatermarkDetectionService {
             // in case that's ever configured per-user.
             long hopsPerCycle = Math.max(1, Math.round((c.getCycleSeconds() * sampleRate) / hop));
             hopsPerCycleByUser.put(c.getUserId(), hopsPerCycle);
-            buffersByUser.put(c.getUserId(), new ScratchBuffers(analysisSize, maxReconLen));
         }
 
         // ── Stage 1: coarse (phase, cyclePos) scan. The audio-side masking
         //    analysis for a given phase is shared/sequential (cheap, one
-        //    FFT pass over ~80 frames); scoring every user's cyclePos
-        //    candidates against that shared analysis is independent PER
-        //    USER, so it's fanned out across userScoringExecutor. Each
-        //    phase's per-user work is joined before moving to the next
-        //    phase, since analysis (recomputed per phase) must exist before
-        //    any candidate at that phase can be scored.
+        //    FFT pass over ~80 frames); for each user at that phase, the
+        //    cyclePos range is split into numWorkers chunks and every
+        //    chunk — across every user — is submitted as its own
+        //    independent task, so parallelism scales with core count, not
+        //    with how many people were in the call.
         for (int phase = 0; phase < hop; phase += phaseStride) {
             int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
             if (framesAvailable <= 0) continue;
@@ -364,72 +374,111 @@ public class WatermarkDetectionService {
 
             final int phaseF = phase;
             final int framesAvailableF = framesAvailable;
-            List<CompletableFuture<Void>> futures = new ArrayList<>(sessionConfigs.size());
-            for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-                futures.add(CompletableFuture.runAsync(() -> {
-                    long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                    long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
-                    ScratchBuffers buffers = buffersByUser.get(c.getUserId());
-                    BestAlignment ba = bestByUser.get(c.getUserId());
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-                    for (long cyclePos = 0; cyclePos < hopsPerCycle; cyclePos += cycleStride) {
-                        double score = scoreCandidate(
-                                samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
-                                numBands, window, binToBand, framesAvailableF, buffers);
-                        if (score > ba.score) {
-                            ba.score = score;
-                            ba.phase = phaseF;
-                            ba.cyclePos = cyclePos;
+            for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
+                long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
+                long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
+                long totalCandidates = (hopsPerCycle + cycleStride - 1) / cycleStride;
+                int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
+                long chunkSize = (totalCandidates + chunks - 1) / chunks;
+                BestAlignment ba = bestByUser.get(c.getUserId());
+
+                for (int ci = 0; ci < chunks; ci++) {
+                    long startIdx = (long) ci * chunkSize;
+                    long endIdxExclusive = Math.min(totalCandidates, startIdx + chunkSize);
+                    if (startIdx >= endIdxExclusive) continue;
+
+                    futures.add(CompletableFuture.runAsync(() -> {
+                        ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
+                        double localBestScore = Double.NEGATIVE_INFINITY;
+                        long localBestCyclePos = 0;
+
+                        for (long idx = startIdx; idx < endIdxExclusive; idx++) {
+                            long cyclePos = idx * cycleStride;
+                            double score = scoreCandidate(
+                                    samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
+                                    numBands, window, binToBand, framesAvailableF, buffers);
+                            if (score > localBestScore) {
+                                localBestScore = score;
+                                localBestCyclePos = cyclePos;
+                            }
                         }
-                    }
-                }, userScoringExecutor));
+                        updateBestAlignment(ba, localBestScore, phaseF, localBestCyclePos);
+                    }, userScoringExecutor));
+                }
             }
             futures.forEach(future -> future.join());
         }
 
         // ── Stage 2: local refine at full (1-sample, 1-hop) resolution
-        //    around each user's best coarse candidate. Each user's refine
-        //    window is entirely self-contained (its own analysis calls and
-        //    buffers), so whole per-user refine passes run concurrently.
-        List<CompletableFuture<Void>> refineFutures = new ArrayList<>(sessionConfigs.size());
+        //    around each user's best coarse candidate. The (phase, cyclePos)
+        //    refine grid is flattened and chunked the same way as stage 1.
+        List<CompletableFuture<Void>> refineFutures = new ArrayList<>();
         for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-            refineFutures.add(CompletableFuture.runAsync(() -> {
-                BestAlignment ba = bestByUser.get(c.getUserId());
-                long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
-                ScratchBuffers buffers = buffersByUser.get(c.getUserId());
+            BestAlignment ba = bestByUser.get(c.getUserId());
+            long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
+            long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
 
-                int phaseLo = Math.max(0, ba.phase - phaseStride);
-                int phaseHi = Math.min(hop - 1, ba.phase + phaseStride);
-                long cycleLo = Math.max(0, ba.cyclePos - cycleStride);
-                long cycleHi = Math.min(hopsPerCycle - 1, ba.cyclePos + cycleStride);
+            int phaseLo = Math.max(0, ba.phase - phaseStride);
+            int phaseHi = Math.min(hop - 1, ba.phase + phaseStride);
+            long cycleLo = Math.max(0, ba.cyclePos - cycleStride);
+            long cycleHi = Math.min(hopsPerCycle - 1, ba.cyclePos + cycleStride);
 
-                for (int phase = phaseLo; phase <= phaseHi; phase++) {
-                    int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
-                    if (framesAvailable <= 0) continue;
+            int numPhases = phaseHi - phaseLo + 1;
+            long numCycles = cycleHi - cycleLo + 1;
+            long totalCells = (long) numPhases * numCycles;
+            int chunks = (int) Math.min(numWorkers, Math.max(1, totalCells));
+            long cellChunkSize = (totalCells + chunks - 1) / chunks;
 
-                    FrameAnalysis analysis = analyzeAudioFrames(
-                            samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
+            for (int ci = 0; ci < chunks; ci++) {
+                long startCell = (long) ci * cellChunkSize;
+                long endCellExclusive = Math.min(totalCells, startCell + cellChunkSize);
+                if (startCell >= endCellExclusive) continue;
 
-                    for (long cyclePos = cycleLo; cyclePos <= cycleHi; cyclePos++) {
+                refineFutures.add(CompletableFuture.runAsync(() -> {
+                    ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
+                    double localBestScore = Double.NEGATIVE_INFINITY;
+                    int localBestPhase = phaseLo;
+                    long localBestCyclePos = cycleLo;
+                    // Cache analysis per phase within this chunk, since
+                    // consecutive cells often share the same phase and
+                    // recomputing it per cyclePos would be wasteful.
+                    int cachedPhase = Integer.MIN_VALUE;
+                    FrameAnalysis cachedAnalysis = null;
+
+                    for (long cell = startCell; cell < endCellExclusive; cell++) {
+                        int phase = phaseLo + (int) (cell / numCycles);
+                        long cyclePos = cycleLo + (cell % numCycles);
+
+                        int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
+                        if (framesAvailable <= 0) continue;
+
+                        if (phase != cachedPhase) {
+                            cachedAnalysis = analyzeAudioFrames(
+                                    samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
+                            cachedPhase = phase;
+                        }
+
                         double score = scoreCandidate(
-                                samples, phase, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
+                                samples, phase, cachedAnalysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
                                 numBands, window, binToBand, framesAvailable, buffers);
-                        if (score > ba.score) {
-                            ba.score = score;
-                            ba.phase = phase;
-                            ba.cyclePos = cyclePos;
+                        if (score > localBestScore) {
+                            localBestScore = score;
+                            localBestPhase = phase;
+                            localBestCyclePos = cyclePos;
                         }
                     }
-                }
-            }, userScoringExecutor));
+                    updateBestAlignment(ba, localBestScore, localBestPhase, localBestCyclePos);
+                }, userScoringExecutor));
+            }
         }
         refineFutures.forEach(future -> future.join());
 
         // ── Stage 3: final score at the pinpointed alignment, over the
         //    WHOLE recording — this is what's actually compared against
-        //    DETECTION_THRESHOLD / MIN_SCORE_MARGIN. Also fanned out per
-        //    user since each user's final scoring pass is independent.
+        //    DETECTION_THRESHOLD / MIN_SCORE_MARGIN. One task per user is
+        //    fine here — it's a single evaluation each, not a search.
         Map<String, Double> finalScores = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> finalFutures = new ArrayList<>(sessionConfigs.size());
         for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
@@ -441,7 +490,7 @@ public class WatermarkDetectionService {
                     return;
                 }
 
-                ScratchBuffers buffers = buffersByUser.get(c.getUserId());
+                ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
                 FrameAnalysis analysis = analyzeAudioFrames(
                         samples, ba.phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
