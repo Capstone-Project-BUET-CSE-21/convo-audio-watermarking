@@ -1,0 +1,36 @@
+HELP.md
+target/
+audio-watermark/HELP.md
+audio-watermark/target/
+audio-watermark/.mvn/wrapper/maven-wrapper.jar
+!audio-watermark/**/src/main/**/target/
+!audio-watermark/**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/audio-watermark/nbproject/private/
+/audio-watermark/nbbuild/
+/audio-watermark/dist/
+/audio-watermark/nbdist/
+/audio-watermark/.nb-gradle/
+build/
+!audio-watermark/**/src/main/**/build/
+!audio-watermark/**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+.env

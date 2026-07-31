@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+
+# Build
+target/
+build/
+.gradle
+*.jar
+*.zip
+
+# Documentation
+README.md
+docs/
+
+# CI/CD
+.github
+.gitlab-ci.yml
+Jenkinsfile
+
+# OS
+Thumbs.db
+.env.local
