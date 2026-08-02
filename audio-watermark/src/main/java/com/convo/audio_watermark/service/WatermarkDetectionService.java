@@ -135,14 +135,12 @@ public class WatermarkDetectionService {
      * sharing it would let unrelated work stall detection requests (and
      * vice versa) under load.
      *
-     * Sized from resolveWorkerCount(), NOT a raw Runtime.availableProcessors()
-     * call — on some container/hosting platforms (e.g. small/free-tier
-     * instances with a fractional CPU quota) the JVM reports the host
-     * machine's visible core count rather than the tiny CPU share actually
-     * granted, which spins up far more concurrent threads than the CPU can
-     * service and adds scheduling contention on top of an already slow
-     * request instead of helping. WATERMARK_SEARCH_THREADS lets a
-     * constrained deployment override this without a code change.
+     * CAUTION: on some container/hosting platforms (e.g. small/free-tier
+     * instances with a fractional CPU quota) the JVM's availableProcessors()
+     * reports the host machine's visible core count rather than the tiny CPU
+     * share actually granted — sizing the pool from it can spin up far more
+     * concurrent threads than the CPU can service, adding scheduling
+     * contention on top of an already slow request instead of helping.
      */
     private final int numWorkers = Runtime.getRuntime().availableProcessors();
 

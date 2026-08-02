@@ -53,11 +53,14 @@ public class WatermarkConfigService {
         // candidates, scanned one-by-one — see findBestScoresAcrossUsers'
         // doc comment on why it can't be subsampled), so this value directly
         // and linearly controls detection latency: halving it roughly halves
-        // search time. Was 4.0 (halved from an original 8.0), halved again
-        // to 2.0 after real-world testing on a CPU-constrained host (Render
-        // free tier) showed detection still taking minutes — keep it as
-        // short as your expected clip length allows, not longer than needed.
-        config.setCycleSeconds(2.0);
+        // search time. History on a CPU-constrained host (Render free tier),
+        // for a ~6s test clip: first deploy of the exhaustive search fix at
+        // 4.0 took ~8-9min; halving to 2.0 brought it to ~4-5min, confirming
+        // the ~2x-per-halving relationship. Still too slow, so halved again
+        // to 1.0 — must stay comfortably below your shortest expected
+        // recording length (guarantees at least one full repeat), not
+        // shorter than needed.
+        config.setCycleSeconds(1.0);
 
         return repository.save(config);
     }
