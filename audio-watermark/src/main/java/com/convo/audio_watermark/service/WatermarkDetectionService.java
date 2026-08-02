@@ -32,15 +32,20 @@ import java.util.concurrent.TimeUnit;
  * (needed a cooperating "reset" signal) or expensive (search cost grew with
  * meeting length).
  *
- * The search is still two-dimensional:
+ * The search is still two-dimensional, but the two dimensions behave very
+ * differently and are searched differently:
  * 1. cyclePos — which position within the repeat cycle the recording's
  *    first frame corresponds to. Bounded to [0, hopsPerCycle), which is
  *    small and FIXED regardless of call length (e.g. ~3750 positions for a
- *    20-second cycle at a 256-sample hop / 48kHz).
- * 2. phase — the exact sample offset within a hop the recording begins at,
- *    unchanged from before; unrelated to cycle length, still needs its own
- *    small search because pseudorandom sequences don't tolerate even
- *    small misalignment.
+ *    20-second cycle at a 256-sample hop / 48kHz) — but must be scanned
+ *    EXHAUSTIVELY (see stage 1 in findBestScoresAcrossUsers): each step
+ *    jumps the PRNG by a full analysisSize draws, so neighboring cyclePos
+ *    values are statistically independent of each other, with no partial
+ *    correlation to guide a coarse-then-refine search toward the true one.
+ * 2. phase — the exact sample offset within a hop the recording begins at.
+ *    Unlike cyclePos, neighboring phases share most of the same underlying
+ *    audio samples in their analysis window, so the score varies smoothly
+ *    here — a coarse grid + local refine is valid for this dimension.
  *
  * As before: jumping the PRNG to a candidate cyclePos is O(1) (see
  * stateAfterDraws) rather than stepping through every preceding frame, and
@@ -83,11 +88,22 @@ public class WatermarkDetectionService {
      */
     private static final double MIN_SCORE_MARGIN = 0.01;
 
-    /** Coarse cyclePos stride divisor — see findBestScoresAcrossUsers. */
-    private static final int COARSE_CYCLE_CANDIDATES = 200;
-
-    /** Total coarse sample-phase candidates spread across one hop. */
-    private static final int PHASE_COARSE_CANDIDATES = 8;
+    /**
+     * Total coarse sample-phase candidates spread across one hop.
+     *
+     * CALIBRATED FROM MEASUREMENT, not a guess: probing the actual score-vs-
+     * phase curve at a known-correct cyclePos (holding cyclePos fixed, then
+     * scoring every one of the 256 possible phase values at a 256-sample
+     * hop) showed a real, exploitable peak at the true phase, but one that
+     * decays to noise-floor within roughly +/-10 samples — i.e. much
+     * narrower than assumed. The previous value of 8 gave a 32-sample
+     * stride (worst case 16 samples from the true phase — already past the
+     * peak, into the noise floor), which combined with the cyclePos issue
+     * documented in findBestScoresAcrossUsers to make the coarse stage
+     * reliably miss real alignments. 32 candidates gives an 8-sample
+     * stride (worst case 4 samples off — still solidly on the peak).
+     */
+    private static final int PHASE_COARSE_CANDIDATES = 32;
 
     /**
      * Frames used during the coarse + refine search stages (~0.4s of audio
@@ -232,8 +248,14 @@ public class WatermarkDetectionService {
         }
 
         // ── 5. Apply detection threshold + minimum margin over runner-up ────
+        // The margin check only makes sense when there's a runner-up to be
+        // confused with. With exactly one registered user, secondBestScore
+        // is set equal to bestScore just above (no real runner-up exists),
+        // which would make the margin exactly 0 and detection permanently
+        // impossible regardless of how strong the real score is — skip the
+        // margin requirement in that case and rely on the raw threshold.
         boolean detected = bestScore >= DETECTION_THRESHOLD
-                && (bestScore - secondBestScore) >= MIN_SCORE_MARGIN;
+                && (allUserScores.size() == 1 || (bestScore - secondBestScore) >= MIN_SCORE_MARGIN);
 
         final String finalBestUser = bestUserId;
         WatermarkConfigRepository.DetectionConfigProjection winnerConfig = sessionConfigs.stream()
@@ -358,13 +380,31 @@ public class WatermarkDetectionService {
             hopsPerCycleByUser.put(c.getUserId(), hopsPerCycle);
         }
 
-        // ── Stage 1: coarse (phase, cyclePos) scan. The audio-side masking
-        //    analysis for a given phase is shared/sequential (cheap, one
-        //    FFT pass over ~80 frames); for each user at that phase, the
-        //    cyclePos range is split into numWorkers chunks and every
-        //    chunk — across every user — is submitted as its own
-        //    independent task, so parallelism scales with core count, not
-        //    with how many people were in the call.
+        // ── Stage 1: coarse phase scan × EXHAUSTIVE cyclePos scan. The
+        //    audio-side masking analysis for a given phase is
+        //    shared/sequential (cheap, one FFT pass over ~80 frames); for
+        //    each user at that phase, the cyclePos range is split into
+        //    numWorkers chunks and every chunk — across every user — is
+        //    submitted as its own independent task, so parallelism scales
+        //    with core count, not with how many people were in the call.
+        //
+        //    cyclePos MUST be scanned exhaustively (stride 1), unlike
+        //    phase: each cyclePos step jumps the PRNG state by a full
+        //    analysisSize draws (see stateAfterDraws), producing a
+        //    completely independent pseudorandom sequence from its
+        //    neighbors — there is no "basin" of partial correlation around
+        //    the true cyclePos the way nearby phases share overlapping
+        //    sample content. A subsampled coarse grid here has no way to
+        //    land near the true value; it can only ever hit it exactly or
+        //    miss it entirely, and stage 2's refine window (centered on
+        //    whatever the coarse stage picked) can't recover a miss. This
+        //    used to be subsampled to 1-in-~(hopsPerCycle/200) candidates
+        //    via a COARSE_CYCLE_CANDIDATES stride, which meant real
+        //    alignment was found only by chance — verified against known
+        //    synthetic recordings where the true (phase, cyclePos) was
+        //    known: the subsampled search consistently missed it, reporting
+        //    scores near the noise floor despite the true alignment scoring
+        //    5-40x higher.
         for (int phase = 0; phase < hop; phase += phaseStride) {
             int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
             if (framesAvailable <= 0) continue;
@@ -378,8 +418,7 @@ public class WatermarkDetectionService {
 
             for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
-                long totalCandidates = (hopsPerCycle + cycleStride - 1) / cycleStride;
+                long totalCandidates = hopsPerCycle;
                 int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
                 long chunkSize = (totalCandidates + chunks - 1) / chunks;
                 BestAlignment ba = bestByUser.get(c.getUserId());
@@ -395,7 +434,7 @@ public class WatermarkDetectionService {
                         long localBestCyclePos = 0;
 
                         for (long idx = startIdx; idx < endIdxExclusive; idx++) {
-                            long cyclePos = idx * cycleStride;
+                            long cyclePos = idx;
                             double score = scoreCandidate(
                                     samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
                                     numBands, window, binToBand, framesAvailableF, buffers);
@@ -414,11 +453,15 @@ public class WatermarkDetectionService {
         // ── Stage 2: local refine at full (1-sample, 1-hop) resolution
         //    around each user's best coarse candidate. The (phase, cyclePos)
         //    refine grid is flattened and chunked the same way as stage 1.
+        //    cyclePos only needs a +/-1 hedge here (not a wide window): the
+        //    coarse stage above already scanned every cyclePos exhaustively
+        //    at its chosen phase, so this is only covering the case where a
+        //    refined (in-between) phase shifts the ideal cyclePos by one.
         List<CompletableFuture<Void>> refineFutures = new ArrayList<>();
         for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
             BestAlignment ba = bestByUser.get(c.getUserId());
             long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-            long cycleStride = Math.max(1, hopsPerCycle / COARSE_CYCLE_CANDIDATES);
+            long cycleStride = 1;
 
             int phaseLo = Math.max(0, ba.phase - phaseStride);
             int phaseHi = Math.min(hop - 1, ba.phase + phaseStride);
