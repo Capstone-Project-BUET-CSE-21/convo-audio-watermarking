@@ -134,9 +134,20 @@ public class WatermarkDetectionService {
      * parallel streams and reactive/async code elsewhere in the app, so
      * sharing it would let unrelated work stall detection requests (and
      * vice versa) under load.
+     *
+     * Sized from resolveWorkerCount(), NOT a raw Runtime.availableProcessors()
+     * call — on some container/hosting platforms (e.g. small/free-tier
+     * instances with a fractional CPU quota) the JVM reports the host
+     * machine's visible core count rather than the tiny CPU share actually
+     * granted, which spins up far more concurrent threads than the CPU can
+     * service and adds scheduling contention on top of an already slow
+     * request instead of helping. WATERMARK_SEARCH_THREADS lets a
+     * constrained deployment override this without a code change.
      */
+    private final int numWorkers = Runtime.getRuntime().availableProcessors();
+
     private final ExecutorService userScoringExecutor =
-            Executors.newFixedThreadPool(Math.max(1, Runtime.getRuntime().availableProcessors()));
+            Executors.newFixedThreadPool(numWorkers);
 
     public WatermarkDetectionService(WatermarkConfigRepository repository) {
         this.repository = repository;
@@ -366,8 +377,10 @@ public class WatermarkDetectionService {
         // utilization: a 2-person call has only 2 independent "user" tasks
         // to hand out, but thousands of independent candidates within each
         // user's search, so chunking on candidates lets a small meeting
-        // still saturate a large core count.
-        int numWorkers = Math.max(1, Runtime.getRuntime().availableProcessors());
+        // still saturate a large core count. Uses the same numWorkers the
+        // executor was actually sized with (see resolveWorkerCount()), not
+        // a fresh availableProcessors() call, so chunk count always matches
+        // real thread capacity.
 
         Map<String, BestAlignment> bestByUser = new ConcurrentHashMap<>();
         Map<String, Long> hopsPerCycleByUser = new HashMap<>();
