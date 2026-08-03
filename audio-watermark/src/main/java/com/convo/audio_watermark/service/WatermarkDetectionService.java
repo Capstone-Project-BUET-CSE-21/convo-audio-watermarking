@@ -2,67 +2,31 @@ package com.convo.audio_watermark.service;
 
 import com.convo.audio_watermark.dto.WatermarkDetectionResponse;
 import com.convo.audio_watermark.repository.WatermarkConfigRepository;
-import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
-import javax.sound.sampled.*;
-import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import javax.sound.sampled.UnsupportedAudioFileException;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Detects audio watermarks embedded by the front-end audio worklet.
  *
- * SYNCHRONIZATION (repeating-tag design): the embedder no longer runs one
- * never-repeating PRNG stream for the whole call. Instead, its watermark
- * repeats on a fixed cycle (see cycleSeconds / hopsPerCycle) — frame f's
- * pattern depends only on (f mod hopsPerCycle), never on how long the call
- * has been running. That means ANY recording at least one cycle long is
- * guaranteed to contain a full repetition somewhere in it, and this
- * detector only ever needs to search within ONE cycle's length — a fixed,
- * small window — rather than across the whole call, which is what made the
- * earlier frame-0-alignment / whole-call-search approaches either fragile
- * (needed a cooperating "reset" signal) or expensive (search cost grew with
- * meeting length).
- *
- * The search is still two-dimensional, but the two dimensions behave very
- * differently and are searched differently:
- * 1. cyclePos — which position within the repeat cycle the recording's
- *    first frame corresponds to. Bounded to [0, hopsPerCycle), which is
- *    small and FIXED regardless of call length (e.g. ~3750 positions for a
- *    20-second cycle at a 256-sample hop / 48kHz) — but must be scanned
- *    EXHAUSTIVELY (see stage 1 in findBestScoresAcrossUsers): each step
- *    jumps the PRNG by a full analysisSize draws, so neighboring cyclePos
- *    values are statistically independent of each other, with no partial
- *    correlation to guide a coarse-then-refine search toward the true one.
- * 2. phase — the exact sample offset within a hop the recording begins at.
- *    Unlike cyclePos, neighboring phases share most of the same underlying
- *    audio samples in their analysis window, so the score varies smoothly
- *    here — a coarse grid + local refine is valid for this dimension.
- *
- * As before: jumping the PRNG to a candidate cyclePos is O(1) (see
- * stateAfterDraws) rather than stepping through every preceding frame, and
- * the audio-side masking-threshold analysis for a given phase is shared
- * across every user and every cyclePos candidate tested at that phase
- * (see analyzeAudioFrames) since it depends only on the recorded samples.
- *
- * SCHEMA NOTE: this assumes each user's registered config also carries a
- * cycleSeconds value matching what the embedder used (see
- * DetectionConfigProjection.getCycleSeconds() below) — add this alongside
- * frameSize / analysisWindowSize / numBands if it isn't already present in
- * your config table/projection/DTO plumbing.
- *
- * Everything below the search itself (PN generation, masking-threshold
- * shaping, IFFT/overlap-add reconstruction, per-frame normalised
- * correlation, FFT/Hann/Bark-band helpers, audio decoding) is unchanged and
- * still mirrors the JS embedder exactly — see the per-method docs below.
+ * Orchestration only — the actual work is split across three collaborators:
+ * <ul>
+ *   <li>{@link WatermarkAudioDecoder} — turns an uploaded file into mono
+ *       float PCM samples (WAV natively, everything else via ffmpeg).</li>
+ *   <li>{@link WatermarkSearchEngine} — the cycle-bounded synchronization
+ *       search (coarse scan, local refine, final scoring) that pinpoints
+ *       each registered user's alignment and score. See its class doc for
+ *       why cyclePos must be scanned exhaustively.</li>
+ *   <li>{@link WatermarkDsp} — the pure signal-processing core (FFT,
+ *       masking-threshold analysis, PN generation, correlation scoring)
+ *       both of the above build on, mirroring the JS embedder exactly.</li>
+ * </ul>
  */
 @Service
 public class WatermarkDetectionService {
@@ -72,11 +36,12 @@ public class WatermarkDetectionService {
      *
      * IMPORTANT — CALIBRATION: this score is the average of PER-FRAME
      * normalised correlations at the winning alignment (see
-     * scoreWithAnalysis), not a single whole-recording correlation. This has
-     * not yet been calibrated against real known-good / known-bad
-     * recordings. Treat 0.015 below as a placeholder only — re-run known-good
-     * and known-bad test recordings with this scoring method and set both
-     * thresholds from that data before relying on this in production.
+     * WatermarkDsp.scoreWithAnalysis), not a single whole-recording
+     * correlation. This has not yet been calibrated against real
+     * known-good / known-bad recordings. Treat 0.015 below as a placeholder
+     * only — re-run known-good and known-bad test recordings with this
+     * scoring method and set both thresholds from that data before relying
+     * on this in production.
      */
     private static final double DETECTION_THRESHOLD = 0.015;
 
@@ -87,45 +52,6 @@ public class WatermarkDetectionService {
      * calibration as DETECTION_THRESHOLD.
      */
     private static final double MIN_SCORE_MARGIN = 0.01;
-
-    /**
-     * Total coarse sample-phase candidates spread across one hop.
-     *
-     * CALIBRATED FROM MEASUREMENT, not a guess: probing the actual score-vs-
-     * phase curve at a known-correct cyclePos (holding cyclePos fixed, then
-     * scoring every one of the 256 possible phase values at a 256-sample
-     * hop) showed a real, exploitable peak at the true phase, but one that
-     * decays to noise-floor within roughly +/-10 samples — i.e. much
-     * narrower than assumed. The previous value of 8 gave a 32-sample
-     * stride (worst case 16 samples from the true phase — already past the
-     * peak, into the noise floor), which combined with the cyclePos issue
-     * documented in findBestScoresAcrossUsers to make the coarse stage
-     * reliably miss real alignments. 32 candidates gives an 8-sample
-     * stride (worst case 4 samples off — still solidly on the peak).
-     */
-    private static final int PHASE_COARSE_CANDIDATES = 32;
-
-    /**
-     * Frames used during the coarse + refine search stages (~0.85s of audio
-     * at a 256-sample hop / 48kHz). The final reported score always uses the
-     * FULL recording at the winning alignment (see stage 3 in
-     * findBestScoresAcrossUsers), so this only affects how reliably the
-     * search LOCATES the right alignment, not the quality of the final
-     * reported score — but "how reliably" is not a minor concern: at 80,
-     * empirically, the exhaustive fallback search (see stage 3b in detect())
-     * missed the true alignment outright on a reproducible ~1-in-6
-     * to ~1-in-3 basis (verified against known synthetic recordings; more
-     * candidates tested per request raises the noise-floor "best wrong
-     * score" via order statistics, and 80 frames wasn't enough averaging
-     * per candidate to keep the true one clear of it). 160 was verified
-     * against a known-failing case (scored 0.0145, under DETECTION_THRESHOLD,
-     * at 80) and fully recovered it (0.288, matching the oracle ceiling).
-     * This raises search cost roughly proportionally, which is an
-     * acceptable trade now that the exhaustive search is only the FALLBACK
-     * path (see the near-cyclePos=0 fast path in detect()) rather than the
-     * common case.
-     */
-    private static final int SEARCH_FRAME_COUNT = 160;
 
     /**
      * Width of the cheap "near cyclePos=0" fast-path window tried before
@@ -141,70 +67,27 @@ public class WatermarkDetectionService {
      */
     private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
 
-    /** Sample rate FFmpeg resamples fallback-decoded audio to. */
-    private static final int TARGET_SAMPLE_RATE = 48000;
-
-    /** Max time to let a single ffmpeg transcode run before giving up. */
-    private static final long FFMPEG_TIMEOUT_SECONDS = 60;
-
     private final WatermarkConfigRepository repository;
+    private final WatermarkAudioDecoder audioDecoder;
+    private final WatermarkSearchEngine searchEngine;
 
-    /**
-     * Dedicated pool for parallelizing per-user candidate scoring in
-     * findBestScoresAcrossUsers. Each registered user's search (Stage 1/2/3)
-     * is independent of every other user's, so with N users and C cores this
-     * cuts wall-clock time roughly from O(N) sequential work to O(N / C).
-     *
-     * Deliberately a private pool rather than parallelStream()'s shared
-     * ForkJoinPool.commonPool() — that pool is also used by unrelated
-     * parallel streams and reactive/async code elsewhere in the app, so
-     * sharing it would let unrelated work stall detection requests (and
-     * vice versa) under load.
-     *
-     * CAUTION: on some container/hosting platforms (e.g. small/free-tier
-     * instances with a fractional CPU quota) the JVM's availableProcessors()
-     * reports the host machine's visible core count rather than the tiny CPU
-     * share actually granted — sizing the pool from it can spin up far more
-     * concurrent threads than the CPU can service, adding scheduling
-     * contention on top of an already slow request instead of helping.
-     */
-    private final int numWorkers = Runtime.getRuntime().availableProcessors();
-
-    private final ExecutorService userScoringExecutor =
-            Executors.newFixedThreadPool(numWorkers);
-
-    public WatermarkDetectionService(WatermarkConfigRepository repository) {
+    public WatermarkDetectionService(
+            WatermarkConfigRepository repository,
+            WatermarkAudioDecoder audioDecoder,
+            WatermarkSearchEngine searchEngine) {
         this.repository = repository;
-    }
-
-    @jakarta.annotation.PreDestroy
-    public void shutdownExecutor() {
-        userScoringExecutor.shutdown();
+        this.audioDecoder = audioDecoder;
+        this.searchEngine = searchEngine;
     }
 
     /**
-     * Fail fast at startup if ffmpeg isn't available in this environment,
-     * rather than discovering it silently on the first non-WAV upload.
+     * Convenience for manual/test callers that construct this service
+     * directly (bypassing Spring, so no @PreDestroy lifecycle runs) — the
+     * search engine owns the actual thread pool.
      */
-    @PostConstruct
-    public void verifyFfmpegAvailable() {
-        try {
-            Process p = new ProcessBuilder("ffmpeg", "-version").start();
-            boolean finished = p.waitFor(10, TimeUnit.SECONDS);
-            if (!finished || p.exitValue() != 0) {
-                throw new IllegalStateException("ffmpeg check failed or timed out");
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException(
-                    "ffmpeg is not available on this system — audio decoding for non-WAV formats "
-                            + "(MP3/AAC/M4A/Opus) will fail. Ensure ffmpeg is installed in the "
-                            + "deployment environment (see Dockerfile).", e);
-        }
+    public void shutdownExecutor() {
+        searchEngine.shutdownExecutor();
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Public API
-    // ─────────────────────────────────────────────────────────────────────────
 
     public WatermarkDetectionResponse detect(MultipartFile audioFile, String sessionId)
             throws IOException, UnsupportedAudioFileException {
@@ -221,7 +104,7 @@ public class WatermarkDetectionService {
         }
 
         // ── 2. Decode audio to float samples & extract sample rate ──────────
-        DecodedAudio decoded = decodeAudioToFloatSamples(audioFile);
+        WatermarkAudioDecoder.DecodedAudio decoded = audioDecoder.decode(audioFile);
         float[] samples = decoded.samples;
         float sampleRate = decoded.sampleRate;
 
@@ -241,8 +124,8 @@ public class WatermarkDetectionService {
                 ? sessionConfigs.get(0).getNumBands() : 24;
 
         // Precompute shared resources
-        float[] window = hannWindow(analysisSize);
-        int[] binToBand = buildBinToBandMap(analysisSize, sampleRate, numBands);
+        float[] window = WatermarkDsp.hannWindow(analysisSize);
+        int[] binToBand = WatermarkDsp.buildBinToBandMap(analysisSize, sampleRate, numBands);
 
         int hop = frameSize;
         int numFrames = samples.length / hop;
@@ -272,7 +155,7 @@ public class WatermarkDetectionService {
         //    below — this is what keeps the exhaustive search's generality
         //    for EXTERNAL recorders while giving in-app ones a near-instant
         //    path.
-        Map<String, Double> fastPathScores = findBestScoresAcrossUsers(
+        Map<String, Double> fastPathScores = searchEngine.findBestScoresAcrossUsers(
                 samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand,
                 FAST_PATH_CYCLE_POS_LIMIT);
         WatermarkDetectionResponse fastPathResponse = buildDetectionResponse(
@@ -282,7 +165,7 @@ public class WatermarkDetectionService {
         }
 
         // ── 3b. Fallback: full exhaustive cycle-bounded search ───────────────
-        Map<String, Double> allUserScores = findBestScoresAcrossUsers(
+        Map<String, Double> allUserScores = searchEngine.findBestScoresAcrossUsers(
                 samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand, null);
         return buildDetectionResponse(
                 allUserScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "full search");
@@ -356,752 +239,6 @@ public class WatermarkDetectionService {
                 roundedScores,
                 userDisplayNames,
                 message);
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Cycle-bounded synchronization search
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** Tracks the best (phase, cyclePos, score) found so far for one user. */
-    private static class BestAlignment {
-        double score = Double.NEGATIVE_INFINITY;
-        int phase = 0;
-        long cyclePos = 0;
-    }
-
-    /** Per-frame masking-threshold analysis of the recorded audio at a given phase. */
-    private static class FrameAnalysis {
-        final double[][] spreadThreshold; // [frame][band]
-        FrameAnalysis(double[][] spreadThreshold) {
-            this.spreadThreshold = spreadThreshold;
-        }
-    }
-
-    /**
-     * Scratch buffers reused across every candidate evaluated by ONE
-     * parallel task, instead of each candidate allocating (and
-     * zero-initializing) its own. With thousands of candidates tested per
-     * request, fresh allocation per call was the original bottleneck — not
-     * the actual FFT/correlation work — since {@code recon} in particular
-     * can be tens of thousands of elements.
-     *
-     * ONE INSTANCE PER TASK, NOT PER USER: search work is chunked across
-     * candidates (see findBestScoresAcrossUsers), not just across users —
-     * a single user's search can now run as several concurrent chunks on
-     * different threads, so buffers must be scoped to whichever chunk owns
-     * them, not shared per-user (that would let concurrent chunks corrupt
-     * each other's scratch arrays mid-FFT). The number of tasks is still
-     * small and bounded (phases × users × workers), so this stays far
-     * cheaper than the original per-candidate allocation.
-     */
-    private static class ScratchBuffers {
-        final double[] pnRe;
-        final double[] pnIm;
-        final double[] recon;
-        final long[] prngState = new long[1]; // reused instead of allocated per frame
-
-        ScratchBuffers(int analysisSize, int maxReconLen) {
-            pnRe = new double[analysisSize];
-            pnIm = new double[analysisSize];
-            recon = new double[maxReconLen];
-        }
-    }
-
-    /** Thread-safe "keep if better" update — multiple chunks for the same user can finish concurrently. */
-    private static void updateBestAlignment(BestAlignment ba, double score, int phase, long cyclePos) {
-        synchronized (ba) {
-            if (score > ba.score) {
-                ba.score = score;
-                ba.phase = phase;
-                ba.cyclePos = cyclePos;
-            }
-        }
-    }
-
-    /**
-     * @param cyclePosLimit if non-null, only cyclePos candidates in
-     *                      [0, min(cyclePosLimit, hopsPerCycle)) are tried —
-     *                      used for the cheap near-zero fast pass. Null
-     *                      means the full exhaustive [0, hopsPerCycle)
-     *                      range, as required for external/uncooperative
-     *                      recordings with no known alignment.
-     */
-    private Map<String, Double> findBestScoresAcrossUsers(
-            float[] samples,
-            List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs,
-            int hop, int analysisSize, int numBands, float sampleRate,
-            float[] window, int[] binToBand, Long cyclePosLimit) {
-
-        int numDetectorFrames = samples.length / hop;
-        int searchFrameCount = Math.min(SEARCH_FRAME_COUNT, numDetectorFrames);
-
-        int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
-        int maxReconLen = numDetectorFrames * hop + analysisSize;
-
-        // Chunk count (not user count) is what determines actual core
-        // utilization: a 2-person call has only 2 independent "user" tasks
-        // to hand out, but thousands of independent candidates within each
-        // user's search, so chunking on candidates lets a small meeting
-        // still saturate a large core count. numWorkers is the same field
-        // the executor itself was sized with (see its declaration above),
-        // so chunk count always matches real thread capacity.
-        Map<String, BestAlignment> bestByUser = new ConcurrentHashMap<>();
-        Map<String, Long> hopsPerCycleByUser = new HashMap<>();
-        for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-            bestByUser.put(c.getUserId(), new BestAlignment());
-            // Each user's cycle length in hops — MUST match what their
-            // embedder used (config.cycleSeconds), not a shared constant,
-            // in case that's ever configured per-user.
-            long hopsPerCycle = Math.max(1, Math.round((c.getCycleSeconds() * sampleRate) / hop));
-            hopsPerCycleByUser.put(c.getUserId(), hopsPerCycle);
-        }
-
-        // ── Stage 1: coarse phase scan × EXHAUSTIVE cyclePos scan. The
-        //    audio-side masking analysis for a given phase is
-        //    shared/sequential (cheap, one FFT pass over ~80 frames); for
-        //    each user at that phase, the cyclePos range is split into
-        //    numWorkers chunks and every chunk — across every user — is
-        //    submitted as its own independent task, so parallelism scales
-        //    with core count, not with how many people were in the call.
-        //
-        //    cyclePos MUST be scanned exhaustively (stride 1), unlike
-        //    phase: each cyclePos step jumps the PRNG state by a full
-        //    analysisSize draws (see stateAfterDraws), producing a
-        //    completely independent pseudorandom sequence from its
-        //    neighbors — there is no "basin" of partial correlation around
-        //    the true cyclePos the way nearby phases share overlapping
-        //    sample content. A subsampled coarse grid here has no way to
-        //    land near the true value; it can only ever hit it exactly or
-        //    miss it entirely, and stage 2's refine window (centered on
-        //    whatever the coarse stage picked) can't recover a miss. This
-        //    used to be subsampled to 1-in-~(hopsPerCycle/200) candidates
-        //    via a COARSE_CYCLE_CANDIDATES stride, which meant real
-        //    alignment was found only by chance — verified against known
-        //    synthetic recordings where the true (phase, cyclePos) was
-        //    known: the subsampled search consistently missed it, reporting
-        //    scores near the noise floor despite the true alignment scoring
-        //    5-40x higher.
-        for (int phase = 0; phase < hop; phase += phaseStride) {
-            int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
-            if (framesAvailable <= 0) continue;
-
-            FrameAnalysis analysis = analyzeAudioFrames(
-                    samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
-
-            final int phaseF = phase;
-            final int framesAvailableF = framesAvailable;
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-            for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-                long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                long totalCandidates = cyclePosLimit != null
-                        ? Math.min(cyclePosLimit, hopsPerCycle)
-                        : hopsPerCycle;
-                int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
-                long chunkSize = (totalCandidates + chunks - 1) / chunks;
-                BestAlignment ba = bestByUser.get(c.getUserId());
-
-                for (int ci = 0; ci < chunks; ci++) {
-                    long startIdx = (long) ci * chunkSize;
-                    long endIdxExclusive = Math.min(totalCandidates, startIdx + chunkSize);
-                    if (startIdx >= endIdxExclusive) continue;
-
-                    futures.add(CompletableFuture.runAsync(() -> {
-                        ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
-                        double localBestScore = Double.NEGATIVE_INFINITY;
-                        long localBestCyclePos = 0;
-
-                        for (long idx = startIdx; idx < endIdxExclusive; idx++) {
-                            long cyclePos = idx;
-                            double score = scoreCandidate(
-                                    samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
-                                    numBands, window, binToBand, framesAvailableF, buffers);
-                            if (score > localBestScore) {
-                                localBestScore = score;
-                                localBestCyclePos = cyclePos;
-                            }
-                        }
-                        updateBestAlignment(ba, localBestScore, phaseF, localBestCyclePos);
-                    }, userScoringExecutor));
-                }
-            }
-            futures.forEach(future -> future.join());
-        }
-
-        // ── Stage 2: local refine at full (1-sample, 1-hop) resolution
-        //    around each user's best coarse candidate. The (phase, cyclePos)
-        //    refine grid is flattened and chunked the same way as stage 1.
-        //    cyclePos only needs a +/-1 hedge here (not a wide window): the
-        //    coarse stage above already scanned every cyclePos exhaustively
-        //    at its chosen phase, so this is only covering the case where a
-        //    refined (in-between) phase shifts the ideal cyclePos by one.
-        List<CompletableFuture<Void>> refineFutures = new ArrayList<>();
-        for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-            BestAlignment ba = bestByUser.get(c.getUserId());
-            long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-            long cycleStride = 1;
-
-            int phaseLo = Math.max(0, ba.phase - phaseStride);
-            int phaseHi = Math.min(hop - 1, ba.phase + phaseStride);
-            long cycleLo = Math.max(0, ba.cyclePos - cycleStride);
-            long cycleHi = Math.min(hopsPerCycle - 1, ba.cyclePos + cycleStride);
-
-            int numPhases = phaseHi - phaseLo + 1;
-            long numCycles = cycleHi - cycleLo + 1;
-            long totalCells = (long) numPhases * numCycles;
-            int chunks = (int) Math.min(numWorkers, Math.max(1, totalCells));
-            long cellChunkSize = (totalCells + chunks - 1) / chunks;
-
-            for (int ci = 0; ci < chunks; ci++) {
-                long startCell = (long) ci * cellChunkSize;
-                long endCellExclusive = Math.min(totalCells, startCell + cellChunkSize);
-                if (startCell >= endCellExclusive) continue;
-
-                refineFutures.add(CompletableFuture.runAsync(() -> {
-                    ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
-                    double localBestScore = Double.NEGATIVE_INFINITY;
-                    int localBestPhase = phaseLo;
-                    long localBestCyclePos = cycleLo;
-                    // Cache analysis per phase within this chunk, since
-                    // consecutive cells often share the same phase and
-                    // recomputing it per cyclePos would be wasteful.
-                    int cachedPhase = Integer.MIN_VALUE;
-                    FrameAnalysis cachedAnalysis = null;
-
-                    for (long cell = startCell; cell < endCellExclusive; cell++) {
-                        int phase = phaseLo + (int) (cell / numCycles);
-                        long cyclePos = cycleLo + (cell % numCycles);
-
-                        int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
-                        if (framesAvailable <= 0) continue;
-
-                        if (phase != cachedPhase) {
-                            cachedAnalysis = analyzeAudioFrames(
-                                    samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
-                            cachedPhase = phase;
-                        }
-
-                        double score = scoreCandidate(
-                                samples, phase, cachedAnalysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
-                                numBands, window, binToBand, framesAvailable, buffers);
-                        if (score > localBestScore) {
-                            localBestScore = score;
-                            localBestPhase = phase;
-                            localBestCyclePos = cyclePos;
-                        }
-                    }
-                    updateBestAlignment(ba, localBestScore, localBestPhase, localBestCyclePos);
-                }, userScoringExecutor));
-            }
-        }
-        refineFutures.forEach(future -> future.join());
-
-        // ── Stage 3: final score at the pinpointed alignment, over the
-        //    WHOLE recording — this is what's actually compared against
-        //    DETECTION_THRESHOLD / MIN_SCORE_MARGIN. One task per user is
-        //    fine here — it's a single evaluation each, not a search.
-        Map<String, Double> finalScores = new ConcurrentHashMap<>();
-        List<CompletableFuture<Void>> finalFutures = new ArrayList<>(sessionConfigs.size());
-        for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-            finalFutures.add(CompletableFuture.runAsync(() -> {
-                BestAlignment ba = bestByUser.get(c.getUserId());
-                int framesAvailable = (samples.length - ba.phase) / hop;
-                if (framesAvailable <= 0) {
-                    finalScores.put(c.getUserId(), 0.0);
-                    return;
-                }
-
-                ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
-                FrameAnalysis analysis = analyzeAudioFrames(
-                        samples, ba.phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
-                long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                double score = scoreCandidate(
-                        samples, ba.phase, analysis, c, ba.cyclePos, hopsPerCycle, hop, analysisSize,
-                        numBands, window, binToBand, framesAvailable, buffers);
-
-                finalScores.put(c.getUserId(), score);
-            }, userScoringExecutor));
-        }
-        finalFutures.forEach(future -> future.join());
-
-        // Preserve original registration order in the returned map (used
-        // for display ordering downstream), since ConcurrentHashMap doesn't.
-        Map<String, Double> ordered = new LinkedHashMap<>();
-        for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
-            ordered.put(c.getUserId(), finalScores.get(c.getUserId()));
-        }
-        return ordered;
-    }
-
-    private double scoreCandidate(
-            float[] samples, int phase, FrameAnalysis analysis,
-            WatermarkConfigRepository.DetectionConfigProjection config, long cyclePos, long hopsPerCycle,
-            int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
-            int frameCount, ScratchBuffers buffers) {
-
-        long baseSeedState = resolveSeed(config.getSeed());
-        double marginLinear = Math.pow(10.0, config.getAlpha() / 20.0);
-        return scoreWithAnalysis(
-                samples, phase, analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
-                numBands, window, binToBand, marginLinear, frameCount, buffers);
-    }
-
-    /**
-     * Jump a mulberry32 PRNG state ahead by {@code numDraws} calls in O(1).
-     *
-     * mulberry32's state update is a plain linear counter increment
-     * (state = (state + 0x6d2b79f5) mod 2^32) applied BEFORE each call's
-     * output scrambling — the scrambling never feeds back into the counter.
-     * That means the state after N calls is simply the initial state plus
-     * N * increment (mod 2^32), computable directly instead of by stepping
-     * through N calls one at a time. This is what lets the detector jump
-     * straight to a candidate cyclePos instead of replaying every prior
-     * frame in the cycle.
-     */
-    private long stateAfterDraws(long initialState, long numDraws) {
-        long increment = 0x6d2b79f5L;
-        return (initialState + numDraws * increment) & 0xFFFFFFFFL;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Watermark reconstruction + correlation — mirrors the embedder pipeline
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Analyses {@code frameCount} hop-aligned frames of the recorded audio
-     * starting at sample {@code sampleOffset} ("phase"), producing the
-     * per-frame masking threshold the embedder would have used to shape its
-     * watermark. This depends only on the recorded samples and the phase —
-     * never on which user or cyclePos is being tested — so callers compute
-     * it once per phase and reuse it across every user and every cyclePos
-     * candidate tested at that phase.
-     *
-     * WARM-UP NOTE: mirrors the embedder's zero-filled sliding analysis
-     * buffer (this._analysisBuf = new Float32Array(analysisSize) in the JS
-     * worklet), which slides left by one hop per frame — so the first frame
-     * or two analyse a window that's partly zeros, exactly as the embedder's
-     * would have been at its own startup.
-     */
-    private FrameAnalysis analyzeAudioFrames(
-            float[] samples, int sampleOffset, int hop, int analysisSize, int numBands,
-            float[] window, int[] binToBand, int frameCount) {
-
-        double[] analysisBuf = new double[analysisSize];
-        double[] audioRe = new double[analysisSize];
-        double[] audioIm = new double[analysisSize];
-        double[] bandEnergy = new double[numBands];
-        double[] bandLogSum = new double[numBands];
-        double[] bandCount = new double[numBands];
-        double[] bandFlatness = new double[numBands];
-        double[] bandThreshold = new double[numBands];
-        double[] spreadScratch = new double[numBands];
-
-        double[][] spreadThreshold = new double[frameCount][numBands];
-
-        for (int f = 0; f < frameCount; f++) {
-            int off = sampleOffset + f * hop;
-
-            System.arraycopy(analysisBuf, hop, analysisBuf, 0, analysisSize - hop);
-            int copyCount = Math.max(0, Math.min(hop, samples.length - off));
-            for (int i = 0; i < copyCount; i++) {
-                analysisBuf[analysisSize - hop + i] = samples[off + i];
-            }
-            for (int i = copyCount; i < hop; i++) {
-                analysisBuf[analysisSize - hop + i] = 0.0;
-            }
-
-            for (int i = 0; i < analysisSize; i++) {
-                audioRe[i] = analysisBuf[i] * window[i];
-                audioIm[i] = 0.0;
-            }
-            fft(audioRe, audioIm, false);
-
-            Arrays.fill(bandEnergy, 0.0);
-            Arrays.fill(bandLogSum, 0.0);
-            Arrays.fill(bandCount, 0.0);
-            for (int k = 0; k < analysisSize / 2; k++) {
-                double mag2 = audioRe[k] * audioRe[k] + audioIm[k] * audioIm[k];
-                int b = binToBand[k];
-                bandEnergy[b] += mag2;
-                bandLogSum[b] += Math.log(mag2 + 1e-12);
-                bandCount[b] += 1.0;
-            }
-            for (int b = 0; b < numBands; b++) {
-                double count = Math.max(bandCount[b], 1.0);
-                double geoMean = Math.exp(bandLogSum[b] / count);
-                double arithMean = bandEnergy[b] / count;
-                bandFlatness[b] = geoMean / (arithMean + 1e-12);
-                bandEnergy[b] = arithMean;
-            }
-            for (int b = 0; b < numBands; b++) {
-                double flat = Math.min(Math.max(bandFlatness[b], 0.0), 1.0);
-                double offsetDb = 18.0 - flat * 12.0;
-                double energyDb = 10.0 * Math.log10(bandEnergy[b] + 1e-12);
-                bandThreshold[b] = Math.pow(10.0, (energyDb - offsetDb) / 10.0);
-            }
-            // 3-tap left-to-right cascading spread — mirrors the JS
-            // worklet's in-place update order exactly (band b's spread uses
-            // band b-1's already-spread value and band b+1's raw value).
-            for (int b = 0; b < numBands; b++) {
-                double left = b > 0 ? spreadScratch[b - 1] : bandThreshold[b];
-                double right = b < numBands - 1 ? bandThreshold[b + 1] : bandThreshold[b];
-                spreadScratch[b] = 0.5 * bandThreshold[b] + 0.25 * left + 0.25 * right;
-            }
-            System.arraycopy(spreadScratch, 0, spreadThreshold[f], 0, numBands);
-        }
-
-        return new FrameAnalysis(spreadThreshold);
-    }
-
-    /**
-     * Reconstructs the predicted watermark-only signal for one (seed,
-     * phase, cyclePos) candidate using the precomputed masking analysis,
-     * then scores it against the actual recorded audio via per-frame
-     * normalised cross-correlation, averaged across frames.
-     *
-     * CYCLE WRAP: each frame's PRNG state is derived fresh from
-     * ((cyclePos + f) mod hopsPerCycle) — mirroring the embedder's
-     * _randForFrame exactly — rather than letting one PRNG state advance
-     * continuously across the whole scoring loop. Without this, a
-     * recording that straddles a cycle boundary (its true start is near
-     * the END of a cycle and runs into the next repeat) would score
-     * correctly only up to the boundary, then compare against the wrong,
-     * "unwrapped" continuation for every frame after it — dragging the
-     * average down for no reason related to whether the seed is actually
-     * correct.
-     *
-     * Scoring is per-frame (not one global correlation) because the
-     * masking-driven shaping makes every candidate's reconstruction louder
-     * exactly when the real audio is louder, regardless of whether the seed
-     * is correct — a global correlation would pick up on that shared
-     * loudness envelope as a false signal. Normalising each frame by its own
-     * local energy isolates the actual noise-pattern match instead.
-     */
-    private double scoreWithAnalysis(
-            float[] samples, int sampleOffset, FrameAnalysis analysis,
-            long baseSeedState, long cyclePos, long hopsPerCycle,
-            int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
-            double marginLinear, int frameCount, ScratchBuffers buffers) {
-
-        double[] pnRe = buffers.pnRe;
-        double[] pnIm = buffers.pnIm;
-        double[] recon = buffers.recon;
-        int reconLen = frameCount * hop + analysisSize;
-        // Only clear the portion this call actually uses — reused across
-        // every candidate, so stale values from a previous (possibly
-        // longer) call must not leak in, but there's no need to touch the
-        // rest of a buffer sized for the largest call this request makes.
-        Arrays.fill(recon, 0, reconLen, 0.0);
-
-        for (int f = 0; f < frameCount; f++) {
-            int off = f * hop;
-
-            // Fresh state per frame, wrapped to this frame's position
-            // within the cycle — matches _randForFrame in the JS embedder.
-            // Reuses buffers.prngState (mutated in place by mulberry32Next)
-            // instead of allocating a new long[] here: this runs inside the
-            // innermost loop — frames x candidates x users per request —
-            // so per-frame allocation here was a real, avoidable GC cost.
-            long cyclePosF = (cyclePos + f) % hopsPerCycle;
-            buffers.prngState[0] = stateAfterDraws(baseSeedState, cyclePosF * (long) analysisSize);
-
-            for (int k = 0; k < analysisSize; k++) {
-                pnRe[k] = mulberry32Next(buffers.prngState) * 2.0 - 1.0;
-                pnIm[k] = 0.0;
-            }
-            fft(pnRe, pnIm, false);
-
-            double[] spreadThreshold = analysis.spreadThreshold[f];
-            for (int k = 0; k < analysisSize / 2; k++) {
-                int b = binToBand[k];
-                double mag = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
-                double gain = (Math.sqrt(spreadThreshold[b]) * marginLinear) / mag;
-                pnRe[k] *= gain;
-                pnIm[k] *= gain;
-                int mirror = (analysisSize - k) % analysisSize;
-                pnRe[mirror] = pnRe[k];
-                pnIm[mirror] = -pnIm[k];
-            }
-
-            fft(pnRe, pnIm, true);
-            for (int i = 0; i < analysisSize; i++) {
-                pnRe[i] *= window[i];
-            }
-
-            for (int i = 0; i < analysisSize && (off + i) < recon.length; i++) {
-                recon[off + i] += pnRe[i];
-            }
-        }
-
-        double totalNormCorr = 0.0;
-        int scoredFrames = 0;
-        for (int f = 0; f < frameCount; f++) {
-            int off = f * hop;
-            int sOff = sampleOffset + off;
-            double corr = 0.0, audioPower = 0.0, reconPower = 0.0;
-            for (int i = 0; i < hop && (sOff + i) < samples.length; i++) {
-                double a = samples[sOff + i];
-                double r = recon[off + i];
-                corr += a * r;
-                audioPower += a * a;
-                reconPower += r * r;
-            }
-            double denom = Math.sqrt(audioPower * reconPower);
-            if (denom > 1e-9) {
-                totalNormCorr += corr / denom;
-                scoredFrames++;
-            }
-        }
-        return scoredFrames > 0 ? totalNormCorr / scoredFrames : 0.0;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // FFT — exact port of the JS worklet's radix-2 iterative FFT
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static void fft(double[] re, double[] im, boolean invert) {
-        int n = re.length;
-        for (int i = 1, j = 0; i < n; i++) {
-            int bit = n >> 1;
-            for (; (j & bit) != 0; bit >>= 1) {
-                j ^= bit;
-            }
-            j ^= bit;
-            if (i < j) {
-                double tmp = re[i]; re[i] = re[j]; re[j] = tmp;
-                tmp = im[i]; im[i] = im[j]; im[j] = tmp;
-            }
-        }
-        for (int len = 2; len <= n; len <<= 1) {
-            double ang = (2.0 * Math.PI / len) * (invert ? -1 : 1);
-            double wr = Math.cos(ang);
-            double wi = Math.sin(ang);
-            for (int i = 0; i < n; i += len) {
-                double curWr = 1.0, curWi = 0.0;
-                for (int j = 0; j < len / 2; j++) {
-                    double ur = re[i + j], ui = im[i + j];
-                    double vr = re[i + j + len / 2] * curWr - im[i + j + len / 2] * curWi;
-                    double vi = re[i + j + len / 2] * curWi + im[i + j + len / 2] * curWr;
-                    re[i + j] = ur + vr;
-                    im[i + j] = ui + vi;
-                    re[i + j + len / 2] = ur - vr;
-                    im[i + j + len / 2] = ui - vi;
-                    double nWr = curWr * wr - curWi * wi;
-                    double nWi = curWr * wi + curWi * wr;
-                    curWr = nWr;
-                    curWi = nWi;
-                }
-            }
-        }
-        if (invert) {
-            for (int i = 0; i < n; i++) {
-                re[i] /= n;
-                im[i] /= n;
-            }
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Hann window — mirrors JS _hannWindow(n)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static float[] hannWindow(int n) {
-        float[] w = new float[n];
-        for (int i = 0; i < n; i++) {
-            w[i] = (float) (0.5 - 0.5 * Math.cos(2.0 * Math.PI * i / (n - 1)));
-        }
-        return w;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Bark-band mapping — mirrors JS _hzToBark and _buildBinToBandMap
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static double hzToBark(double hz) {
-        return 13.0 * Math.atan(0.00076 * hz) + 3.5 * Math.atan(Math.pow(hz / 7500.0, 2));
-    }
-
-    private static int[] buildBinToBandMap(int n, float sampleRate, int numBands) {
-        int[] map = new int[n];
-        double nyquistBark = hzToBark(sampleRate / 2.0);
-        for (int k = 0; k < n; k++) {
-            double hz = (double) k * sampleRate / n;
-            double bark = hzToBark(hz);
-            int band = (int) Math.floor((bark / nyquistBark) * numBands);
-            if (band >= numBands) band = numBands - 1;
-            if (band < 0) band = 0;
-            map[k] = band;
-        }
-        return map;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Audio decoding — tries AudioSystem (WAV/AIFF/AU) first, falls back to
-    // FFmpeg for everything else (MP3, AAC, M4A, Opus, ...)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private static class DecodedAudio {
-        final float[] samples;
-        final float sampleRate;
-        DecodedAudio(float[] samples, float sampleRate) {
-            this.samples = samples;
-            this.sampleRate = sampleRate;
-        }
-    }
-
-    private DecodedAudio decodeAudioToFloatSamples(MultipartFile audioFile)
-            throws IOException, UnsupportedAudioFileException {
-
-        byte[] fileBytes = audioFile.getBytes();
-
-        try {
-            return decodeUsingAudioSystem(fileBytes);
-        } catch (UnsupportedAudioFileException e) {
-            return decodeUsingFfmpeg(fileBytes, audioFile.getOriginalFilename());
-        }
-    }
-
-    private DecodedAudio decodeUsingAudioSystem(byte[] fileBytes)
-            throws IOException, UnsupportedAudioFileException {
-
-        try (AudioInputStream ais = AudioSystem.getAudioInputStream(
-                new BufferedInputStream(new ByteArrayInputStream(fileBytes)))) {
-
-            AudioFormat src = ais.getFormat();
-            float sampleRate = src.getSampleRate();
-
-            AudioFormat pcmFormat = new AudioFormat(
-                    AudioFormat.Encoding.PCM_SIGNED,
-                    sampleRate,
-                    16,
-                    1,
-                    2,
-                    sampleRate,
-                    false);
-
-            try (AudioInputStream pcm = AudioSystem.getAudioInputStream(pcmFormat, ais)) {
-                return new DecodedAudio(pcmBytesToFloats(pcm.readAllBytes()), sampleRate);
-            }
-        }
-    }
-
-    private DecodedAudio decodeUsingFfmpeg(byte[] fileBytes, String originalFilename) throws IOException {
-
-        Path inputPath = Files.createTempFile("watermark-in-", extractExtension(originalFilename));
-        Path outputPath = Files.createTempFile("watermark-out-", ".wav");
-
-        try {
-            Files.write(inputPath, fileBytes);
-
-            List<String> command = List.of(
-                    "ffmpeg",
-                    "-y",
-                    "-i", inputPath.toString(),
-                    "-ac", "1",
-                    "-ar", String.valueOf(TARGET_SAMPLE_RATE),
-                    "-f", "wav",
-                    outputPath.toString());
-
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            String ffmpegOutput;
-            try (InputStream is = process.getInputStream()) {
-                ffmpegOutput = new String(is.readAllBytes());
-            }
-
-            boolean finished;
-            try {
-                finished = process.waitFor(FFMPEG_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while waiting for ffmpeg", ie);
-            }
-
-            if (!finished) {
-                process.destroyForcibly();
-                throw new IOException("ffmpeg timed out while decoding audio");
-            }
-            if (process.exitValue() != 0) {
-                throw new IOException("ffmpeg failed to decode audio (exit=" + process.exitValue()
-                        + "): " + ffmpegOutput);
-            }
-
-            byte[] wavBytes = Files.readAllBytes(outputPath);
-
-            try (AudioInputStream ais = AudioSystem.getAudioInputStream(
-                    new BufferedInputStream(new ByteArrayInputStream(wavBytes)))) {
-
-                AudioFormat src = ais.getFormat();
-                float sampleRate = src.getSampleRate();
-
-                AudioFormat pcmFormat = new AudioFormat(
-                        AudioFormat.Encoding.PCM_SIGNED,
-                        sampleRate, 16, 1, 2, sampleRate, false);
-
-                try (AudioInputStream pcm = AudioSystem.getAudioInputStream(pcmFormat, ais)) {
-                    return new DecodedAudio(pcmBytesToFloats(pcm.readAllBytes()), sampleRate);
-                }
-            } catch (UnsupportedAudioFileException uafe) {
-                throw new IOException("ffmpeg produced a WAV file that could not be read back", uafe);
-            }
-
-        } finally {
-            Files.deleteIfExists(inputPath);
-            Files.deleteIfExists(outputPath);
-        }
-    }
-
-    private String extractExtension(String originalFilename) {
-        if (originalFilename == null) return ".tmp";
-        int dot = originalFilename.lastIndexOf('.');
-        if (dot < 0 || dot == originalFilename.length() - 1) return ".tmp";
-        return originalFilename.substring(dot);
-    }
-
-    private float[] pcmBytesToFloats(byte[] bytes) {
-        int n = bytes.length / 2;
-        float[] out = new float[n];
-        for (int i = 0; i < n; i++) {
-            short s = (short) ((bytes[2 * i + 1] << 8) | (bytes[2 * i] & 0xFF));
-            out[i] = s / 32768.0f;
-        }
-        return out;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PN generation — exact Java port of the front-end JS
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /**
-     * Resolve a seed string to an unsigned 32-bit long, exactly as the JS
-     * worklet does. The JS worklet ALWAYS hashes string seeds via
-     * hashString() — there is no "numeric string -> raw integer" branch.
-     */
-    private long resolveSeed(String seed) {
-        return hashString(seed);
-    }
-
-    private long hashString(String str) {
-        long hash = 5381L;
-        for (int i = 0; i < str.length(); i++)
-            hash = ((((hash & 0xFFFFFFFFL) << 5) + hash) + str.charAt(i)) & 0xFFFFFFFFL;
-        return hash;
-    }
-
-    /** One step of mulberry32 — exact port of JS mulberry32(). */
-    private double mulberry32Next(long[] state) {
-        state[0] = (state[0] + 0x6d2b79f5L) & 0xFFFFFFFFL;
-        long s = state[0];
-        long t = imul32(s ^ (s >>> 15), 1L | s);
-        t = (t + imul32(t ^ (t >>> 7), 61L | t)) ^ t;
-        t = (t ^ (t >>> 14)) & 0xFFFFFFFFL;
-        return t / 4294967296.0;
-    }
-
-    private long imul32(long a, long b) {
-        return (a & 0xFFFFFFFFL) * (b & 0xFFFFFFFFL) & 0xFFFFFFFFL;
     }
 
     private double round4(double v) {
