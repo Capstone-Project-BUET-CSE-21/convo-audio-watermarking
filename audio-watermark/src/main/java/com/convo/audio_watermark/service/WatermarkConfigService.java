@@ -46,21 +46,20 @@ public class WatermarkConfigService {
         config.setNumBands(24);
         // Repeating-tag period — MUST match what audio-processor.worklet.js
         // uses (config.cycleSeconds, defaults to 8 there too if this value
-        // is ever missing). This is what bounds the detector's search to a
-        // fixed window instead of one that grows with call length — see
-        // WatermarkDetectionService. The detector's cyclePos search is
-        // EXHAUSTIVE (hopsPerCycle = cycleSeconds * sampleRate / frameSize
-        // candidates, scanned one-by-one — see findBestScoresAcrossUsers'
-        // doc comment on why it can't be subsampled), so this value directly
-        // and linearly controls detection latency: halving it roughly halves
-        // search time. History on a CPU-constrained host (Render free tier),
-        // for a ~6s test clip: first deploy of the exhaustive search fix at
-        // 4.0 took ~8-9min; halving to 2.0 brought it to ~4-5min, confirming
-        // the ~2x-per-halving relationship. Still too slow, so halved again
-        // to 1.0 — must stay comfortably below your shortest expected
-        // recording length (guarantees at least one full repeat), not
-        // shorter than needed.
-        config.setCycleSeconds(1.0);
+        // is ever missing). This bounds the BLIND exhaustive search (see
+        // WatermarkDetectionService.findBestScoresAcrossUsers) to a fixed
+        // window for EXTERNAL/uncooperative recordings — that search is what
+        // pushed this value down as low as 1.0 during latency tuning (see
+        // git history), trading away robustness (shorter repeat cycle) for
+        // speed. Now that in-app recordings reset the embedder's cycle
+        // position to 0 at capture start (see the 'reset-prng' worklet
+        // message) and detect() tries a cheap near-cyclePos=0 fast path
+        // first, the exhaustive blind search is only the FALLBACK — used
+        // for external recordings or if the fast path misses — so its speed
+        // matters far less than it used to. Set back up to 4.0 for better
+        // robustness; still short of the old 8.0 default per product
+        // preference.
+        config.setCycleSeconds(4.0);
 
         return repository.save(config);
     }

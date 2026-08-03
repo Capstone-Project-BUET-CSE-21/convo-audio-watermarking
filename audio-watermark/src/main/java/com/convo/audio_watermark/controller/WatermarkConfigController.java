@@ -21,7 +21,6 @@ public class WatermarkConfigController {
             @RequestParam String roomId,
             @RequestParam String userId) {
         WatermarkConfig config = service.getOrCreateConfig(roomId, userId);
-        System.out.println("Returning watermark config for roomId=" + roomId + " userId=" + userId);
 
         return Map.of(
                 "seed", config.getSeed(),

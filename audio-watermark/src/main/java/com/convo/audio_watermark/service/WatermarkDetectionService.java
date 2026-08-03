@@ -106,14 +106,40 @@ public class WatermarkDetectionService {
     private static final int PHASE_COARSE_CANDIDATES = 32;
 
     /**
-     * Frames used during the coarse + refine search stages (~0.4s of audio
-     * at a 256-sample hop / 48kHz). Kept short for search speed — the final
-     * reported score always uses the FULL recording at the winning
-     * alignment (see stage 3 in findBestScoresAcrossUsers), so this only
-     * affects how reliably the search LOCATES the right alignment, not the
-     * quality of the final reported score.
+     * Frames used during the coarse + refine search stages (~0.85s of audio
+     * at a 256-sample hop / 48kHz). The final reported score always uses the
+     * FULL recording at the winning alignment (see stage 3 in
+     * findBestScoresAcrossUsers), so this only affects how reliably the
+     * search LOCATES the right alignment, not the quality of the final
+     * reported score — but "how reliably" is not a minor concern: at 80,
+     * empirically, the exhaustive fallback search (see stage 3b in detect())
+     * missed the true alignment outright on a reproducible ~1-in-6
+     * to ~1-in-3 basis (verified against known synthetic recordings; more
+     * candidates tested per request raises the noise-floor "best wrong
+     * score" via order statistics, and 80 frames wasn't enough averaging
+     * per candidate to keep the true one clear of it). 160 was verified
+     * against a known-failing case (scored 0.0145, under DETECTION_THRESHOLD,
+     * at 80) and fully recovered it (0.288, matching the oracle ceiling).
+     * This raises search cost roughly proportionally, which is an
+     * acceptable trade now that the exhaustive search is only the FALLBACK
+     * path (see the near-cyclePos=0 fast path in detect()) rather than the
+     * common case.
      */
-    private static final int SEARCH_FRAME_COUNT = 80;
+    private static final int SEARCH_FRAME_COUNT = 160;
+
+    /**
+     * Width of the cheap "near cyclePos=0" fast-path window tried before
+     * falling back to the full exhaustive search (see detect() stage 3a).
+     * In-app recordings reset the embedder's cycle position to 0 the
+     * instant recording starts (useMeetingRecording.js's 'reset-prng'
+     * message), so their true cyclePos should be at or extremely close to
+     * 0 — this only needs to be wide enough to absorb postMessage delivery
+     * jitter (delivery to a worklet isn't sample-accurate relative to its
+     * process() calls), not to search any meaningful fraction of the full
+     * cycle. 50 hops = 50 * 256 / 48000 ≈ 267ms of tolerance, comfortably
+     * more than realistic message-delivery delay.
+     */
+    private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
 
     /** Sample rate FFmpeg resamples fallback-decoded audio to. */
     private static final int TARGET_SAMPLE_RATE = 48000;
@@ -229,16 +255,51 @@ public class WatermarkDetectionService {
                     "Audio too short for detection (need at least " + hop + " samples).");
         }
 
-        // ── 3. Cycle-bounded sync search + score every registered user ──────
-        Map<String, Double> allUserScores = findBestScoresAcrossUsers(
-                samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand);
-
         Map<String, String> userDisplayNames = new LinkedHashMap<>();
         for (WatermarkConfigRepository.DetectionConfigProjection config : sessionConfigs) {
             userDisplayNames.put(config.getUserId(), config.getDisplayName());
         }
 
-        // ── 4. Find the user with the highest score, and the runner-up ──────
+        // ── 3a. Fast pass: try a small, cheap search near cyclePos=0 first.
+        //    The in-app recorder resets the embedder's cycle position to 0
+        //    the instant recording starts (see useMeetingRecording.js's
+        //    'reset-prng' message and the worklet's handler for it), so for
+        //    those recordings the true alignment is at or very near
+        //    cyclePos=0 — checking there costs almost nothing compared to
+        //    the full exhaustive scan. External/uncooperative recordings
+        //    never get that reset, so this pass naturally won't find a
+        //    confident match for them, and falls through to the full search
+        //    below — this is what keeps the exhaustive search's generality
+        //    for EXTERNAL recorders while giving in-app ones a near-instant
+        //    path.
+        Map<String, Double> fastPathScores = findBestScoresAcrossUsers(
+                samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand,
+                FAST_PATH_CYCLE_POS_LIMIT);
+        WatermarkDetectionResponse fastPathResponse = buildDetectionResponse(
+                fastPathScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "near cyclePos=0");
+        if (fastPathResponse.isWatermarkDetected()) {
+            return fastPathResponse;
+        }
+
+        // ── 3b. Fallback: full exhaustive cycle-bounded search ───────────────
+        Map<String, Double> allUserScores = findBestScoresAcrossUsers(
+                samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand, null);
+        return buildDetectionResponse(
+                allUserScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "full search");
+    }
+
+    /**
+     * Picks the best/runner-up score, applies the detection threshold +
+     * margin, and builds the response DTO — shared between the fast-path
+     * check and the full-search fallback so both stages apply identical
+     * detection logic.
+     */
+    private WatermarkDetectionResponse buildDetectionResponse(
+            Map<String, Double> allUserScores,
+            List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs,
+            Map<String, String> userDisplayNames,
+            String sessionId, int numFrames, String pathLabel) {
+
         String bestUserId = null;
         double bestScore = Double.NEGATIVE_INFINITY;
         double secondBestScore = Double.NEGATIVE_INFINITY;
@@ -256,7 +317,6 @@ public class WatermarkDetectionService {
             secondBestScore = bestScore;
         }
 
-        // ── 5. Apply detection threshold + minimum margin over runner-up ────
         // The margin check only makes sense when there's a runner-up to be
         // confused with. With exactly one registered user, secondBestScore
         // is set equal to bestScore just above (no real runner-up exists),
@@ -274,11 +334,11 @@ public class WatermarkDetectionService {
 
         String message = detected
                 ? String.format(
-                        "Watermark detected. Detected user: '%s' | score=%.6f (margin over runner-up=%.6f)",
-                        winnerConfig.getDisplayName(), bestScore, bestScore - secondBestScore)
+                        "Watermark detected (%s). Detected user: '%s' | score=%.6f (margin over runner-up=%.6f)",
+                        pathLabel, winnerConfig.getDisplayName(), bestScore, bestScore - secondBestScore)
                 : String.format(
-                        "No watermark detected. Highest score: %.6f for user '%s' (margin over runner-up=%.6f)",
-                        bestScore, winnerConfig.getDisplayName(), bestScore - secondBestScore);
+                        "No watermark detected (%s). Highest score: %.6f for user '%s' (margin over runner-up=%.6f)",
+                        pathLabel, bestScore, winnerConfig.getDisplayName(), bestScore - secondBestScore);
 
         Map<String, Double> roundedScores = new LinkedHashMap<>();
         for (Map.Entry<String, Double> e : allUserScores.entrySet()) {
@@ -358,11 +418,19 @@ public class WatermarkDetectionService {
         }
     }
 
+    /**
+     * @param cyclePosLimit if non-null, only cyclePos candidates in
+     *                      [0, min(cyclePosLimit, hopsPerCycle)) are tried —
+     *                      used for the cheap near-zero fast pass. Null
+     *                      means the full exhaustive [0, hopsPerCycle)
+     *                      range, as required for external/uncooperative
+     *                      recordings with no known alignment.
+     */
     private Map<String, Double> findBestScoresAcrossUsers(
             float[] samples,
             List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs,
             int hop, int analysisSize, int numBands, float sampleRate,
-            float[] window, int[] binToBand) {
+            float[] window, int[] binToBand, Long cyclePosLimit) {
 
         int numDetectorFrames = samples.length / hop;
         int searchFrameCount = Math.min(SEARCH_FRAME_COUNT, numDetectorFrames);
@@ -370,16 +438,13 @@ public class WatermarkDetectionService {
         int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
         int maxReconLen = numDetectorFrames * hop + analysisSize;
 
-        // How many independent chunks to split EACH user's candidate range
-        // into. This — not user count — is what determines actual core
+        // Chunk count (not user count) is what determines actual core
         // utilization: a 2-person call has only 2 independent "user" tasks
         // to hand out, but thousands of independent candidates within each
         // user's search, so chunking on candidates lets a small meeting
-        // still saturate a large core count. Uses the same numWorkers the
-        // executor was actually sized with (see resolveWorkerCount()), not
-        // a fresh availableProcessors() call, so chunk count always matches
-        // real thread capacity.
-
+        // still saturate a large core count. numWorkers is the same field
+        // the executor itself was sized with (see its declaration above),
+        // so chunk count always matches real thread capacity.
         Map<String, BestAlignment> bestByUser = new ConcurrentHashMap<>();
         Map<String, Long> hopsPerCycleByUser = new HashMap<>();
         for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
@@ -429,7 +494,9 @@ public class WatermarkDetectionService {
 
             for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                long totalCandidates = hopsPerCycle;
+                long totalCandidates = cyclePosLimit != null
+                        ? Math.min(cyclePosLimit, hopsPerCycle)
+                        : hopsPerCycle;
                 int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
                 long chunkSize = (totalCandidates + chunks - 1) / chunks;
                 BestAlignment ba = bestByUser.get(c.getUserId());

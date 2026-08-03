@@ -72,7 +72,7 @@ public class WatermarkDetectionController {
         } catch (UnsupportedAudioFileException e) {
             return ResponseEntity.badRequest()
                     .body(Map.of(
-                            "error", "Unsupported audio format. Please upload a WAV file.",
+                            "error", "Unsupported audio format. Please upload a WAV, MP3, AAC, M4A, or Opus file.",
                             "detail", e.getMessage()));
 
         } catch (IOException e) {

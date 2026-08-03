@@ -20,15 +20,6 @@ public interface WatermarkConfigRepository extends JpaRepository<WatermarkConfig
             """, nativeQuery = true)
     Optional<Long> findMeetingUserIdByMeetingCodeAndUserId(String meetingCode, String userId);
 
-    @Query(value = """
-            select wc.*
-            from watermark_config wc
-            join meeting_user mu on wc.meeting_user_id = mu.id
-            join meetings m on mu.meeting_id = m.id
-            where m.meeting_code = :meetingCode
-            """, nativeQuery = true)
-    List<WatermarkConfig> findByMeetingCode(String meetingCode);
-
     interface DetectionConfigProjection {
         String getUserId();
 
