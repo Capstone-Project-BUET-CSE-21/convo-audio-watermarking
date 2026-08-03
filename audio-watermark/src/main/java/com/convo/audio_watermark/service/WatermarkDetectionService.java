@@ -54,16 +54,22 @@ public class WatermarkDetectionService {
     private static final double MIN_SCORE_MARGIN = 0.01;
 
     /**
-     * Width of the cheap "near cyclePos=0" fast-path window tried before
-     * falling back to the full exhaustive search (see detect() stage 3a).
-     * In-app recordings reset the embedder's cycle position to 0 the
-     * instant recording starts (useMeetingRecording.js's 'reset-prng'
-     * message), so their true cyclePos should be at or extremely close to
-     * 0 — this only needs to be wide enough to absorb postMessage delivery
-     * jitter (delivery to a worklet isn't sample-accurate relative to its
-     * process() calls), not to search any meaningful fraction of the full
-     * cycle. 50 hops = 50 * 256 / 48000 ≈ 267ms of tolerance, comfortably
-     * more than realistic message-delivery delay.
+     * Width, in EITHER direction, of the cheap fast-path window around
+     * cyclePos=0 tried before falling back to the full exhaustive search
+     * (see detect() stage 3a; the actual wraparound handling lives in
+     * WatermarkSearchEngine.findBestScoresAcrossUsers). In-app recordings
+     * reset the embedder's cycle position to 0 the instant recording starts
+     * (useMeetingRecording.js's 'reset-prng' message), so their true
+     * cyclePos should be extremely close to 0 — but not necessarily AT or
+     * AFTER it. Confirmed against a real recording: the reset message
+     * itself was delivered promptly (~7ms), yet the true alignment still
+     * landed 6 hops on the OTHER side of the wrap (hopsPerCycle - 6), most
+     * likely from audio-sample latency in the cross-AudioContext
+     * MediaStream bridge between the embedder and the recorder — a
+     * separate thing from message-delivery latency, and not something a
+     * forward-only window can ever catch. 50 hops = 50 * 256 / 48000 ≈
+     * 267ms of tolerance in each direction, comfortably more than the
+     * observed ~32ms (6-hop) gap.
      */
     private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
 
@@ -143,23 +149,25 @@ public class WatermarkDetectionService {
             userDisplayNames.put(config.getUserId(), config.getDisplayName());
         }
 
-        // ── 3a. Fast pass: try a small, cheap search near cyclePos=0 first.
-        //    The in-app recorder resets the embedder's cycle position to 0
-        //    the instant recording starts (see useMeetingRecording.js's
-        //    'reset-prng' message and the worklet's handler for it), so for
-        //    those recordings the true alignment is at or very near
-        //    cyclePos=0 — checking there costs almost nothing compared to
-        //    the full exhaustive scan. External/uncooperative recordings
-        //    never get that reset, so this pass naturally won't find a
-        //    confident match for them, and falls through to the full search
-        //    below — this is what keeps the exhaustive search's generality
-        //    for EXTERNAL recorders while giving in-app ones a near-instant
-        //    path.
+        // ── 3a. Fast pass: try a small, cheap search near cyclePos=0 first,
+        //    in BOTH directions (see WatermarkSearchEngine's cyclePosLimit
+        //    doc for why the backward/wraparound side matters just as much
+        //    as the forward side). The in-app recorder resets the
+        //    embedder's cycle position to 0 the instant recording starts
+        //    (see useMeetingRecording.js's 'reset-prng' message and the
+        //    worklet's handler for it), so for those recordings the true
+        //    alignment is at or very near cyclePos=0 — checking there costs
+        //    almost nothing compared to the full exhaustive scan. External/
+        //    uncooperative recordings never get that reset, so this pass
+        //    naturally won't find a confident match for them, and falls
+        //    through to the full search below — this is what keeps the
+        //    exhaustive search's generality for EXTERNAL recorders while
+        //    giving in-app ones a near-instant path.
         Map<String, Double> fastPathScores = searchEngine.findBestScoresAcrossUsers(
                 samples, sessionConfigs, hop, analysisSize, numBands, sampleRate, window, binToBand,
                 FAST_PATH_CYCLE_POS_LIMIT);
         WatermarkDetectionResponse fastPathResponse = buildDetectionResponse(
-                fastPathScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "near cyclePos=0");
+                fastPathScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "near cyclePos=0 (either direction)");
         if (fastPathResponse.isWatermarkDetected()) {
             return fastPathResponse;
         }

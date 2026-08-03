@@ -177,12 +177,29 @@ class WatermarkSearchEngine {
     }
 
     /**
-     * @param cyclePosLimit if non-null, only cyclePos candidates in
-     *                      [0, min(cyclePosLimit, hopsPerCycle)) are tried —
-     *                      used for the cheap near-zero fast pass. Null
-     *                      means the full exhaustive [0, hopsPerCycle)
-     *                      range, as required for external/uncooperative
-     *                      recordings with no known alignment.
+     * @param cyclePosLimit if non-null, only cyclePos candidates within
+     *                      {@code cyclePosLimit} hops of 0 are tried, in
+     *                      EITHER direction — [0, limit) AND
+     *                      (hopsPerCycle - limit, hopsPerCycle) — used for
+     *                      the cheap near-zero fast pass. Null means the
+     *                      full exhaustive [0, hopsPerCycle) range, as
+     *                      required for external/uncooperative recordings
+     *                      with no known alignment.
+     *
+     *                      The backward side matters: a real recording
+     *                      pinned by a "reset-prng" signal doesn't
+     *                      necessarily land at or after cyclePos=0 — the
+     *                      audio actually captured can correspond to
+     *                      samples the embedder generated slightly BEFORE
+     *                      the reset took effect (e.g. buffering in a
+     *                      cross-AudioContext MediaStream bridge), which
+     *                      wraps to just UNDER hopsPerCycle, not just over
+     *                      0. Confirmed against a real recording where the
+     *                      reset-prng message itself was delivered
+     *                      promptly (~7ms) but the true alignment was
+     *                      still 6 hops shy of hopsPerCycle — a
+     *                      forward-only window scored that case as pure
+     *                      noise and let another user's noise ceiling win.
      */
     Map<String, Double> findBestScoresAcrossUsers(
             float[] samples,
@@ -236,9 +253,21 @@ class WatermarkSearchEngine {
 
             for (WatermarkConfigRepository.DetectionConfigProjection c : sessionConfigs) {
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                long totalCandidates = cyclePosLimit != null
-                        ? Math.min(cyclePosLimit, hopsPerCycle)
-                        : hopsPerCycle;
+                // wrapLimit > 0 means the candidate set is two disjoint
+                // windows — [0, wrapLimit) and (hopsPerCycle - wrapLimit,
+                // hopsPerCycle) — rather than one contiguous range. Once the
+                // requested limit covers at least half the cycle the two
+                // windows would overlap/duplicate, so fall back to a single
+                // exhaustive [0, hopsPerCycle) range instead.
+                long wrapLimit = 0;
+                long totalCandidates;
+                if (cyclePosLimit != null && 2 * Math.min(cyclePosLimit, hopsPerCycle) < hopsPerCycle) {
+                    wrapLimit = Math.min(cyclePosLimit, hopsPerCycle);
+                    totalCandidates = 2 * wrapLimit;
+                } else {
+                    totalCandidates = hopsPerCycle;
+                }
+                final long wrapLimitF = wrapLimit;
                 int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
                 long chunkSize = (totalCandidates + chunks - 1) / chunks;
                 BestAlignment ba = bestByUser.get(c.getUserId());
@@ -254,7 +283,13 @@ class WatermarkSearchEngine {
                         long localBestCyclePos = 0;
 
                         for (long idx = startIdx; idx < endIdxExclusive; idx++) {
-                            long cyclePos = idx;
+                            // idx < wrapLimitF -> forward window [0, wrapLimitF).
+                            // Otherwise -> backward/wraparound window
+                            // (hopsPerCycle - wrapLimitF, hopsPerCycle).
+                            // wrapLimitF == 0 means no split: idx IS the cyclePos.
+                            long cyclePos = (wrapLimitF == 0 || idx < wrapLimitF)
+                                    ? idx
+                                    : hopsPerCycle - wrapLimitF + (idx - wrapLimitF);
                             double score = scoreCandidate(
                                     samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
                                     numBands, window, binToBand, framesAvailableF, buffers);
