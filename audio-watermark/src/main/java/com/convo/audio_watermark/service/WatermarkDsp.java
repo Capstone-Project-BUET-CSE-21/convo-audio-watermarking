@@ -477,23 +477,105 @@ final class WatermarkDsp {
     }
 
     /**
-     * Sum + count pair for one scoring call. Kept separate from the plain
-     * average (see {@link #scoreWithAnalysis}) so callers that need to
-     * COMBINE several scoring calls into one overall score — e.g. one call
-     * per block in the drift-tracking final pass in
-     * {@link WatermarkSearchEngine} — can weight each block by how many
-     * frames it actually contributed, instead of averaging-of-averages
-     * silently overweighting short/last blocks relative to full ones.
+     * Sum + count pair for one scoring call, PLUS the raw (unnormalized)
+     * pieces needed to combine many calls into one energy-weighted
+     * aggregate instead of a plain average — see {@link #weightedAverage()}
+     * and WatermarkSearchEngine's drift-tracking final pass, which uses
+     * this to avoid diluting genuine signal with low-energy (silence /
+     * background-noise) segments of a real-world recording.
      */
     static final class ScoreDetail {
         final double sumNormCorr;
         final int scoredFrames;
-        ScoreDetail(double sumNormCorr, int scoredFrames) {
+        /** Sum of each scored frame's RAW (unnormalized) correlation. */
+        final double sumRawCorr;
+        /** Sum of each scored frame's sqrt(audioPower*reconPower) — the
+         *  same quantity each frame's correlation is normalised BY, reused
+         *  here as a per-frame energy/confidence weight. */
+        final double sumDenom;
+        /** Sum of each scored frame's SQUARED normalised correlation —
+         *  enables a duration-STABLE detection diagnostic (see
+         *  {@link #detectionStat()}): with the plain average, a longer
+         *  recording drives a wrong user's score toward 0 while a real
+         *  user's stays put, but the two scales aren't directly
+         *  comparable across durations; a standardized statistic is. */
+        final double sumSqNormCorr;
+
+        ScoreDetail(double sumNormCorr, int scoredFrames, double sumRawCorr,
+                    double sumDenom, double sumSqNormCorr) {
             this.sumNormCorr = sumNormCorr;
             this.scoredFrames = scoredFrames;
+            this.sumRawCorr = sumRawCorr;
+            this.sumDenom = sumDenom;
+            this.sumSqNormCorr = sumSqNormCorr;
         }
+
+        /** Plain per-frame average of the normalised correlation coefficient — unchanged, original behavior. */
         double average() {
             return scoredFrames > 0 ? sumNormCorr / scoredFrames : 0.0;
+        }
+
+        /**
+         * Standardized detection statistic: mean(c) * sqrt(n) / std(c) over
+         * the scored per-frame normalised correlations c. Under H0 (wrong
+         * seed) this is ~N(0,1) REGARDLESS of recording length, so it's
+         * directly comparable across 2s and 5s and across users; under H1
+         * (real, consistently-aligned watermark) it GROWS ~sqrt(n) with
+         * duration. Not used for the pass/fail decision (that stays on
+         * weightedAverage to preserve the calibrated threshold's meaning) —
+         * logged as a diagnostic so duration-dependent regressions are
+         * visible directly instead of inferred.
+         */
+        double detectionStat() {
+            if (scoredFrames < 2) return 0.0;
+            double mean = sumNormCorr / scoredFrames;
+            double var = (sumSqNormCorr / scoredFrames) - mean * mean;
+            if (var <= 1e-18) return 0.0;
+            return mean * Math.sqrt(scoredFrames) / Math.sqrt(var);
+        }
+
+        /**
+         * Energy-weighted aggregate: sum(rawCorr) / sum(denom), i.e. every
+         * frame's (already scale-invariant, bias-free) correlation
+         * coefficient re-weighted by that frame's OWN signal energy before
+         * combining, instead of counting a near-silent/noisy frame's
+         * high-variance coefficient exactly as much as a loud,
+         * watermark-carrying frame's low-variance one. Still bounded in
+         * [-1, 1] (a weighted average of per-frame values each individually
+         * bounded there by Cauchy-Schwarz), and the weight (denom) is
+         * essentially the SAME for every candidate seed tested at a given
+         * position — it comes from the shared masking-threshold analysis
+         * and the recorded audio, not from the seed — so this doesn't
+         * introduce any seed-dependent bias between competing candidates,
+         * it just stops quiet/noisy stretches of a real recording from
+         * diluting genuine signal down toward zero.
+         *
+         * NOTE: this is duration-stable ONLY as long as every scored frame
+         * is genuinely aligned (carries the repeating watermark). The whole
+         * point of the drift-slope tracking in
+         * WatermarkSearchEngine.driftTrackedFinalScore is to keep that
+         * true — if later frames were allowed to fall out of alignment (as
+         * they did before that fix), their large-energy / zero-correlation
+         * contributions would land in sumDenom with nothing in sumRawCorr
+         * and drag this toward 0 as the recording got longer. Alignment,
+         * not the combiner, is what makes longer recordings safe.
+         */
+        double weightedAverage() {
+            return sumDenom > 1e-9 ? sumRawCorr / sumDenom : 0.0;
+        }
+
+        /** Two ScoreDetail results combined (e.g. across blocks) into one. */
+        static ScoreDetail combine(ScoreDetail a, ScoreDetail b) {
+            return new ScoreDetail(
+                    a.sumNormCorr + b.sumNormCorr,
+                    a.scoredFrames + b.scoredFrames,
+                    a.sumRawCorr + b.sumRawCorr,
+                    a.sumDenom + b.sumDenom,
+                    a.sumSqNormCorr + b.sumSqNormCorr);
+        }
+
+        static ScoreDetail zero() {
+            return new ScoreDetail(0.0, 0, 0.0, 0.0, 0.0);
         }
     }
 
@@ -552,9 +634,38 @@ final class WatermarkDsp {
             double marginLinear, int frameCount,
             double[] pnRe, double[] pnIm, double[] recon, long[] prngState) {
 
+        synthesizeRecon(analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
+                window, binToBand, marginLinear, frameCount, pnRe, pnIm, recon, prngState);
+        return correlateOnly(samples, sampleOffset, recon, hop, 0, frameCount);
+    }
+
+    /**
+     * The FFT-bearing half of {@link #scoreWithAnalysisDetailed}: builds
+     * the predicted watermark-only time-domain signal for one (seed,
+     * cyclePos) candidate into {@code recon}, WITHOUT correlating it
+     * against any recorded audio yet. Split out from the correlation step
+     * (see {@link #correlateOnly}) so a caller that wants to test several
+     * nearby sample-offset alignments against the SAME reconstruction —
+     * e.g. WatermarkSearchEngine's drift-tracking block search — can do
+     * so by calling this ONCE per block and correlateOnly() cheaply per
+     * candidate offset, instead of paying the FFT cost of this method
+     * again for every offset tried. That reuse is the entire point: the
+     * reconstruction depends on the masking analysis, the seed, and
+     * cyclePos — never on which sample offset we're about to test it
+     * against — so recomputing it per offset was pure waste.
+     *
+     * CYCLE WRAP: see {@link #scoreWithAnalysisDetailed} doc (unchanged
+     * behavior, just relocated).
+     */
+    static void synthesizeRecon(
+            FrameAnalysis analysis, long baseSeedState, long cyclePos, long hopsPerCycle,
+            int hop, int analysisSize, float[] window, int[] binToBand,
+            double marginLinear, int frameCount,
+            double[] pnRe, double[] pnIm, double[] recon, long[] prngState) {
+
         int reconLen = frameCount * hop + analysisSize;
         // Only clear the portion this call actually uses — reused across
-        // every candidate, so stale values from a previous (possibly
+        // every block/candidate, so stale values from a previous (possibly
         // longer) call must not leak in, but there's no need to touch the
         // rest of a buffer sized for the largest call this request makes.
         Arrays.fill(recon, 0, reconLen, 0.0);
@@ -565,9 +676,9 @@ final class WatermarkDsp {
             // Fresh state per frame, wrapped to this frame's position
             // within the cycle — matches _randForFrame in the JS embedder.
             // Reuses prngState (mutated in place by mulberry32Next) instead
-            // of allocating a new long[] here: this runs inside the
-            // innermost loop — frames x candidates x users per request —
-            // so per-frame allocation here was a real, avoidable GC cost.
+            // of allocating a new long[] here: this runs inside a loop
+            // that can be frames x blocks x users per request — so
+            // per-frame allocation here was a real, avoidable GC cost.
             long cyclePosF = (cyclePos + f) % hopsPerCycle;
             prngState[0] = stateAfterDraws(baseSeedState, cyclePosF * (long) analysisSize);
 
@@ -598,14 +709,63 @@ final class WatermarkDsp {
                 recon[off + i] += pnRe[i];
             }
         }
+    }
+
+    /**
+     * The correlation-only half of {@link #scoreWithAnalysisDetailed}:
+     * scores an ALREADY-SYNTHESIZED reconstruction (see
+     * {@link #synthesizeRecon}) against the recorded audio via per-frame
+     * normalised cross-correlation. Pure arithmetic — no FFT, no PRNG
+     * draws — so this is cheap enough to call once per candidate offset in
+     * a local phase search (see WatermarkSearchEngine's drift tracking)
+     * without that search ever becoming the bottleneck.
+     *
+     * @param startFrame scores frames [startFrame, startFrame+frameCount)
+     *                   of the reconstruction/recording rather than always
+     *                   starting at frame 0. THIS IS NOT A CONVENIENCE
+     *                   PARAMETER — it exists so a caller can evaluate a
+     *                   DIFFERENT slice of audio than whichever slice it
+     *                   used to CHOOSE {@code sampleOffset} via an argmax
+     *                   search. Scoring the very data a search maximized
+     *                   over is a textbook selection-bias trap: with many
+     *                   candidate offsets tried, SOME candidate is
+     *                   guaranteed to correlate unusually well with THAT
+     *                   SPECIFIC audio purely by chance, for ANY seed —
+     *                   correct or not. That inflated, chance-driven
+     *                   correlation is real (it's not a bug in the math),
+     *                   but it says nothing about whether the seed is
+     *                   genuinely embedded — it would appear for a
+     *                   completely unrelated seed too, just for a
+     *                   different, equally-arbitrary offset. Evaluating a
+     *                   held-out slice the search never touched removes
+     *                   that bias entirely: whatever correlation shows up
+     *                   there reflects the actual audio content, not the
+     *                   search's own ability to find a good-looking
+     *                   coincidence. See WatermarkSearchEngine's
+     *                   driftTrackedFinalScore for how search and scoring
+     *                   are kept on disjoint frames throughout.
+     *
+     * Scoring is per-frame (not one global correlation) because the
+     * masking-driven shaping makes every candidate's reconstruction louder
+     * exactly when the real audio is louder, regardless of whether the seed
+     * is correct — a global correlation would pick up on that shared
+     * loudness envelope as a false signal. Normalising each frame by its own
+     * local energy isolates the actual noise-pattern match instead.
+     */
+    static ScoreDetail correlateOnly(
+            float[] samples, int sampleOffset, double[] recon, int hop, int startFrame, int frameCount) {
 
         double totalNormCorr = 0.0;
+        double totalRawCorr = 0.0;
+        double totalDenom = 0.0;
+        double totalSqNormCorr = 0.0;
         int scoredFrames = 0;
-        for (int f = 0; f < frameCount; f++) {
+        for (int fi = 0; fi < frameCount; fi++) {
+            int f = startFrame + fi;
             int off = f * hop;
             int sOff = sampleOffset + off;
             double corr = 0.0, audioPower = 0.0, reconPower = 0.0;
-            for (int i = 0; i < hop && (sOff + i) < samples.length; i++) {
+            for (int i = 0; i < hop && (sOff + i) < samples.length && (off + i) < recon.length; i++) {
                 double a = samples[sOff + i];
                 double r = recon[off + i];
                 corr += a * r;
@@ -614,11 +774,15 @@ final class WatermarkDsp {
             }
             double denom = Math.sqrt(audioPower * reconPower);
             if (denom > 1e-9) {
-                totalNormCorr += corr / denom;
+                double c = corr / denom;
+                totalNormCorr += c;
+                totalRawCorr += corr;
+                totalDenom += denom;
+                totalSqNormCorr += c * c;
                 scoredFrames++;
             }
         }
-        return new ScoreDetail(totalNormCorr, scoredFrames);
+        return new ScoreDetail(totalNormCorr, scoredFrames, totalRawCorr, totalDenom, totalSqNormCorr);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
