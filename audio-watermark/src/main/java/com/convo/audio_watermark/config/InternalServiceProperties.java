@@ -1,8 +1,11 @@
 package com.convo.audio_watermark.config;
 
 import jakarta.annotation.PostConstruct;
+import org.jspecify.annotations.NonNull;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
+
+import java.util.Objects;
 
 // Config for calling convo-backend's internal, server-to-server API
 // (see MeetingParticipantClient). serviceKey must match convo-backend's
@@ -35,16 +38,22 @@ public class InternalServiceProperties {
         }
     }
 
+    // @NonNull + requireNonNull document and enforce a guarantee validate()
+    // above establishes, not the field's type itself — see
+    // convo-file-sharing's InternalServiceProperties for the full reasoning
+    // (same class, same lifecycle guarantee, same fail-fast backstop).
+    @NonNull
     public String getServiceKey() {
-        return serviceKey;
+        return Objects.requireNonNull(serviceKey, "serviceKey read before validate() ran");
     }
 
     public void setServiceKey(String serviceKey) {
         this.serviceKey = serviceKey;
     }
 
+    @NonNull
     public String getBackendBaseUrl() {
-        return backendBaseUrl;
+        return Objects.requireNonNull(backendBaseUrl, "backendBaseUrl read before validate() ran");
     }
 
     public void setBackendBaseUrl(String backendBaseUrl) {
