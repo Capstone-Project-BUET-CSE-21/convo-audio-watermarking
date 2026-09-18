@@ -268,6 +268,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Detects audio watermarks embedded by the front-end audio worklet.
@@ -341,14 +342,17 @@ public class WatermarkDetectionService {
     private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
 
     private final WatermarkConfigRepository repository;
+    private final MeetingParticipantClient participantClient;
     private final WatermarkAudioDecoder audioDecoder;
     private final WatermarkSearchEngine searchEngine;
 
     public WatermarkDetectionService(
             WatermarkConfigRepository repository,
+            MeetingParticipantClient participantClient,
             WatermarkAudioDecoder audioDecoder,
             WatermarkSearchEngine searchEngine) {
         this.repository = repository;
+        this.participantClient = participantClient;
         this.audioDecoder = audioDecoder;
         this.searchEngine = searchEngine;
     }
@@ -368,8 +372,36 @@ public class WatermarkDetectionService {
         long requestStartNanos = System.nanoTime();
 
         // ── 1. Fetch all registered watermark configs for this meeting ───────
-        List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs = repository
-                .findDetectionConfigsByMeetingCode(sessionId);
+        // Two independent lookups joined in Java: convo-backend owns who
+        // was actually in this meeting (and their display name), this
+        // service owns which of them have a watermark config. A participant
+        // with no config yet (never opened a call that reached
+        // getOrCreateConfig) is naturally excluded — nothing to detect
+        // against for them.
+        Map<String, MeetingParticipantClient.Participant> participantsByUserId = participantClient
+                .listParticipants(sessionId).stream()
+                .collect(Collectors.toMap(p -> p.userId().toString(), p -> p));
+
+        List<DetectionConfigView> sessionConfigs = repository.findByMeetingCode(sessionId).stream()
+                .map(cfg -> {
+                    String userId = cfg.getUserId().toString();
+                    MeetingParticipantClient.Participant participant = participantsByUserId.get(userId);
+                    String displayName = participant != null
+                            && participant.displayName() != null
+                            && !participant.displayName().isBlank()
+                            ? participant.displayName()
+                            : userId;
+                    return new DetectionConfigView(
+                            userId,
+                            displayName,
+                            cfg.getSeed(),
+                            cfg.getAlpha(),
+                            cfg.getFrameSize(),
+                            cfg.getAnalysisWindowSize(),
+                            cfg.getNumBands(),
+                            cfg.getCycleSeconds());
+                })
+                .toList();
         if (sessionConfigs.isEmpty()) {
             return new WatermarkDetectionResponse(
                     null, null, sessionId, 0.0, false, 0, 0,
@@ -421,7 +453,7 @@ public class WatermarkDetectionService {
         }
 
         Map<String, String> userDisplayNames = new LinkedHashMap<>();
-        for (WatermarkConfigRepository.DetectionConfigProjection config : sessionConfigs) {
+        for (DetectionConfigView config : sessionConfigs) {
             userDisplayNames.put(config.getUserId(), config.getDisplayName());
         }
 
@@ -476,7 +508,7 @@ public class WatermarkDetectionService {
      */
     private WatermarkDetectionResponse buildDetectionResponse(
             Map<String, Double> allUserScores,
-            List<WatermarkConfigRepository.DetectionConfigProjection> sessionConfigs,
+            List<DetectionConfigView> sessionConfigs,
             Map<String, String> userDisplayNames,
             String sessionId, int numFrames, String pathLabel) {
 
@@ -507,7 +539,7 @@ public class WatermarkDetectionService {
                 && (allUserScores.size() == 1 || (bestScore - secondBestScore) >= MIN_SCORE_MARGIN);
 
         final String finalBestUser = bestUserId;
-        WatermarkConfigRepository.DetectionConfigProjection winnerConfig = sessionConfigs.stream()
+        DetectionConfigView winnerConfig = sessionConfigs.stream()
                 .filter(c -> c.getUserId().equals(finalBestUser))
                 .findFirst()
                 .orElse(sessionConfigs.get(0));

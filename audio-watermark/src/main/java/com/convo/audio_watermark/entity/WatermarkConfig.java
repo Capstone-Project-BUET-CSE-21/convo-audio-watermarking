@@ -2,17 +2,29 @@ package com.convo.audio_watermark.entity;
 
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
+import java.util.UUID;
 
+// Keyed by (meeting_code, user_id) directly rather than a foreign
+// meeting_user.id — this service no longer reaches into convo-backend's
+// tables (not even by shared surrogate key), so it needs an identity for
+// "which participant, in which meeting" that it can resolve entirely on
+// its own. meeting_code + user_id are exactly what convo-backend's
+// internal API (see MeetingParticipantClient) already hands back, so no
+// translation step is needed either.
 @Entity
-@Table(name = "watermark_config")
+@Table(name = "watermark_config", uniqueConstraints = @UniqueConstraint(
+        name = "uq_watermark_config_meeting_user", columnNames = {"meeting_code", "user_id"}))
 public class WatermarkConfig {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "meeting_user_id", nullable = false)
-    private Long meetingUserId;
+    @Column(name = "meeting_code", nullable = false, length = 64)
+    private String meetingCode;
+
+    @Column(name = "user_id", nullable = false)
+    private UUID userId;
 
     @Column(name = "seed", nullable = false, unique = true)
     private String seed;
@@ -50,12 +62,20 @@ public class WatermarkConfig {
         this.id = id;
     }
 
-    public Long getMeetingUserId() {
-        return meetingUserId;
+    public String getMeetingCode() {
+        return meetingCode;
     }
 
-    public void setMeetingUserId(Long meetingUserId) {
-        this.meetingUserId = meetingUserId;
+    public void setMeetingCode(String meetingCode) {
+        this.meetingCode = meetingCode;
+    }
+
+    public UUID getUserId() {
+        return userId;
+    }
+
+    public void setUserId(UUID userId) {
+        this.userId = userId;
     }
 
     public String getSeed() {

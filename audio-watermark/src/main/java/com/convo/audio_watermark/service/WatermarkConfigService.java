@@ -15,21 +15,31 @@ import java.util.UUID;
 public class WatermarkConfigService {
 
     private final WatermarkConfigRepository repository;
+    private final MeetingParticipantClient participantClient;
 
-    public WatermarkConfigService(WatermarkConfigRepository repository) {
+    public WatermarkConfigService(WatermarkConfigRepository repository, MeetingParticipantClient participantClient) {
         this.repository = repository;
+        this.participantClient = participantClient;
     }
 
     @Transactional
     public WatermarkConfig getOrCreateConfig(String roomId, String userId) {
 
-        Long meetingUserId = repository.findMeetingUserIdByMeetingCodeAndUserId(roomId, userId)
-                .orElseThrow(() -> new ResponseStatusException(
-                        HttpStatus.NOT_FOUND,
-                        "No meeting_user mapping found for roomId=" + roomId + " and userId=" + userId));
+        UUID userUuid = UUID.fromString(userId);
+
+        // Confirms this user is actually a participant of this meeting —
+        // convo-backend is the source of truth for that, not a local join,
+        // now that this service holds no foreign key into its tables.
+        boolean isParticipant = participantClient.listParticipants(roomId).stream()
+                .anyMatch(p -> p.userId().equals(userUuid));
+        if (!isParticipant) {
+            throw new ResponseStatusException(
+                    HttpStatus.NOT_FOUND,
+                    "No meeting participant found for roomId=" + roomId + " and userId=" + userId);
+        }
 
         // Check if seed already exists for this meeting participant
-        Optional<WatermarkConfig> existing = repository.findByMeetingUserId(meetingUserId);
+        Optional<WatermarkConfig> existing = repository.findByMeetingCodeAndUserId(roomId, userUuid);
 
         if (existing.isPresent()) {
             return existing.get();
@@ -37,7 +47,8 @@ public class WatermarkConfigService {
 
         // Generate new unique seed
         WatermarkConfig config = new WatermarkConfig();
-        config.setMeetingUserId(meetingUserId);
+        config.setMeetingCode(roomId);
+        config.setUserId(userUuid);
         config.setSeed(generateUniqueSeed());
         config.setAlpha(4.0);
         config.setFrameSize(256);
