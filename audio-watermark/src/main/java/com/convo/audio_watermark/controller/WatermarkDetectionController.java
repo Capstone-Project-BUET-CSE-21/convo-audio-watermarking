@@ -15,7 +15,7 @@ import java.util.Map;
  * REST controller for the watermark detection endpoint.
  *
  * <pre>
- * POST /api/watermark/detect
+ * POST /api/audio-watermark/detect
  *   Content-Type: multipart/form-data
  *   Parts:
  *     audio     – the audio file to analyse (WAV recommended)
@@ -35,7 +35,7 @@ import java.util.Map;
  * </pre>
  */
 @RestController
-@RequestMapping("/api/watermark")
+@RequestMapping("/api/audio-watermark")
 public class WatermarkDetectionController {
 
     private final WatermarkDetectionService detectionService;

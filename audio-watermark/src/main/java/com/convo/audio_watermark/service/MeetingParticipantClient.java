@@ -36,7 +36,7 @@ public class MeetingParticipantClient {
     public List<Participant> listParticipants(String meetingCode) {
         try {
             Participant[] participants = restClient.get()
-                    .uri("/api/internal/meetings/{meetingCode}/participants", meetingCode)
+                    .uri("/api/backend/internal/meetings/{meetingCode}/participants", meetingCode)
                     .header("X-Internal-Service-Key", properties.getServiceKey())
                     .retrieve()
                     .body(Participant[].class);

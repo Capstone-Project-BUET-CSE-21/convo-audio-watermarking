@@ -7,7 +7,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/api/watermark")
+@RequestMapping("/api/audio-watermark")
 public class WatermarkConfigController {
 
     private final WatermarkConfigService service;
