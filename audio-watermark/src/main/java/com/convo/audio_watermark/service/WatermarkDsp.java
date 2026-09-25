@@ -237,43 +237,61 @@ final class WatermarkDsp {
      * winner exactly, and stage 3 computes the reported score exactly.
      */
     static double scoreSpectral(SpectralFrames sf, PnSpectra pn, long cyclePos, long hopsPerCycle, double marginLinear) {
-        int half = sf.half;
-        double nSquared = (double) sf.n * sf.n;
         double total = 0.0;
         int scored = 0;
-        double prevVariance = 0.0;
         for (int f = 0; f < sf.frames; f++) {
-            int cp = (int) ((cyclePos + f) % hopsPerCycle);
-            int unitBase = cp * half, frameBase = f * half;
-            double shapedDot = 0.0;
-            for (int k = 0; k < half; k++) {
-                shapedDot += sf.aRe[frameBase + k] * pn.unitRe[unitBase + k]
-                        + sf.aIm[frameBase + k] * pn.unitIm[unitBase + k];
-            }
-            double nyquist = pn.re[cp * (half + 1) + half];
-            double corr = marginLinear * shapedDot + sf.aNyquist[f] * nyquist;
-            // Expected per-sample power of this frame's synthesized signal over random PN phases.
-            double variance = (marginLinear * marginLinear * sf.shapedPower[f] + nyquist * nyquist) / nSquared;
-            double reconPower = sf.windowFirstHalfEnergy * variance;
-            if (f > 0) {
-                int cpPrev = (int) ((cyclePos + f - 1) % hopsPerCycle);
-                int prevBase = cpPrev * half;
-                double prevDot = 0.0;
-                for (int k = 0; k < half; k++) {
-                    prevDot += sf.bRe[frameBase + k] * pn.unitRe[prevBase + k]
-                            + sf.bIm[frameBase + k] * pn.unitIm[prevBase + k];
-                }
-                corr += marginLinear * prevDot + sf.bNyquist[f] * pn.re[cpPrev * (half + 1) + half];
-                reconPower += sf.windowSecondHalfEnergy * prevVariance;
-            }
-            double denom = Math.sqrt(sf.audioPower[f] * reconPower);
-            if (denom > 1e-9) {
-                total += corr / denom;
+            double term = spectralFrameTerm(sf, pn, f, (int) ((cyclePos + f) % hopsPerCycle), hopsPerCycle, marginLinear);
+            if (!Double.isNaN(term)) {
+                total += term;
                 scored++;
             }
-            prevVariance = variance;
         }
         return scored > 0 ? total / scored : 0.0;
+    }
+
+    /**
+     * Frame f's term in {@link #scoreSpectral} when it's matched to PN
+     * position cp (and so frame f-1 to cp-1): the hop's normalized
+     * correlation, or NaN for a silent hop, which isn't scored.
+     *
+     * Frames 0 and 1 depend on where the SpectralFrames started (the masking
+     * analysis warms up from zeros, see analyzeAudioFrames, and frame 1's
+     * second term uses frame 0's). From frame 2 on, a term depends only on
+     * the recording around the frame, so it comes out bit-for-bit the same
+     * whichever start it's computed from — which is what lets the search
+     * reuse terms between overlapping windows (WatermarkSearchEngine.Stage1Cache).
+     */
+    static double spectralFrameTerm(SpectralFrames sf, PnSpectra pn, int f, int cp, long hopsPerCycle,
+                                    double marginLinear) {
+        int half = sf.half;
+        double nSquared = (double) sf.n * sf.n;
+        int unitBase = cp * half, frameBase = f * half;
+        double shapedDot = 0.0;
+        for (int k = 0; k < half; k++) {
+            shapedDot += sf.aRe[frameBase + k] * pn.unitRe[unitBase + k]
+                    + sf.aIm[frameBase + k] * pn.unitIm[unitBase + k];
+        }
+        double nyquist = pn.re[cp * (half + 1) + half];
+        double corr = marginLinear * shapedDot + sf.aNyquist[f] * nyquist;
+        // Expected per-sample power of this frame's synthesized signal over random PN phases.
+        double variance = (marginLinear * marginLinear * sf.shapedPower[f] + nyquist * nyquist) / nSquared;
+        double reconPower = sf.windowFirstHalfEnergy * variance;
+        if (f > 0) {
+            int cpPrev = (int) ((cp + hopsPerCycle - 1) % hopsPerCycle);
+            int prevBase = cpPrev * half;
+            double prevDot = 0.0;
+            for (int k = 0; k < half; k++) {
+                prevDot += sf.bRe[frameBase + k] * pn.unitRe[prevBase + k]
+                        + sf.bIm[frameBase + k] * pn.unitIm[prevBase + k];
+            }
+            double prevNyquist = pn.re[cpPrev * (half + 1) + half];
+            corr += marginLinear * prevDot + sf.bNyquist[f] * prevNyquist;
+            double prevVariance = (marginLinear * marginLinear * sf.shapedPower[f - 1] + prevNyquist * prevNyquist)
+                    / nSquared;
+            reconPower += sf.windowSecondHalfEnergy * prevVariance;
+        }
+        double denom = Math.sqrt(sf.audioPower[f] * reconPower);
+        return denom > 1e-9 ? corr / denom : Double.NaN;
     }
 
     /**
