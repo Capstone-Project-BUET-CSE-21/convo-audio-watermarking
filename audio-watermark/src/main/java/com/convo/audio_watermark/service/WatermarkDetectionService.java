@@ -83,19 +83,32 @@ public class WatermarkDetectionService {
      * FULL-SEARCH LOCK WINDOWS. The alignment search only looks at
      * SEARCH_FRAME_COUNT frames (~0.85s) at a time, and on real phone
      * recordings whether a given stretch works is unpredictable: one locked
-     * from 1, 3, 7, 9 and 11s but not from 0s, another only from 10s. So
-     * when the search from the start finds nothing, it's retried from later
-     * points, stopping at the first that yields a detection. Windows are
-     * spread evenly across the recording, at least
-     * LOCK_WINDOW_MIN_SPACING_SECONDS apart, and each must leave
+     * from 1, 3, 7, 9 and 11s but not from 0s; another from 9, 10 and 12s
+     * but not 9.5, 10.5 or 11s; another from 3.0, 3.5 and 4.5s but not 4.0s.
+     * Good stretches can be ~1.5s wide with holes in them, so when the
+     * search from the start finds nothing it's retried every
+     * LOCK_WINDOW_MIN_SPACING_SECONDS (0.5s — 2s spacing missed that last
+     * recording entirely), stopping at the first detection. Long recordings
+     * spread MAX_LOCK_WINDOWS evenly instead. Each window must leave
      * LOCK_WINDOW_MIN_REMAINING_SECONDS after it to score. Every window
      * costs a full exhaustive search, hence the cap — and trying more
      * windows also gives noise more chances, which MIN_CONSISTENCY's margin
-     * (noise never above 3.9) absorbs at this count.
+     * absorbs (noise never above 3.9 across ~250 window scores).
      */
-    private static final int MAX_LOCK_WINDOWS = 8;
-    private static final double LOCK_WINDOW_MIN_SPACING_SECONDS = 2.0;
+    private static final int MAX_LOCK_WINDOWS = 24;
+    private static final double LOCK_WINDOW_MIN_SPACING_SECONDS = 0.5;
     private static final double LOCK_WINDOW_MIN_REMAINING_SECONDS = 2.5;
+
+    /**
+     * How much audio each full-search window scores after its lock (see
+     * WatermarkSearchEngine.findBestScoresAcrossUsers' maxScoreSeconds).
+     * Without a cap, every window scored the whole rest of the recording,
+     * so the full search's cost grew with length squared (a 60s recording
+     * spent more time scoring than searching). Real detections so far
+     * needed 5–15s of scored audio; promising windows are extended to the
+     * full remainder anyway.
+     */
+    private static final double WINDOW_SCORE_SECONDS = 10.0;
 
     private final WatermarkConfigRepository repository;
     private final MeetingParticipantClient participantClient;
@@ -243,7 +256,8 @@ public class WatermarkDetectionService {
         //    giving in-app ones a near-instant path.
         long fastPathStartNanos = System.nanoTime();
         Map<String, WatermarkSearchEngine.UserScore> fastPathScores = searchAllRateGroups(
-                rateGroups, sessionConfigs, hop, analysisSize, numBands, window, FAST_PATH_CYCLE_POS_LIMIT, 0.0);
+                rateGroups, sessionConfigs, hop, analysisSize, numBands, window, FAST_PATH_CYCLE_POS_LIMIT, 0.0, null,
+                null);
         long fastPathNanos = System.nanoTime();
         log.info("watermark-detect[{}] fast-path search took {} ms", sessionId,
                 (fastPathNanos - fastPathStartNanos) / 1_000_000);
@@ -260,10 +274,14 @@ public class WatermarkDetectionService {
         //    detection. If none detects, report the window whose strongest
         //    user came closest.
         WatermarkDetectionResponse closest = null;
-        for (double startSeconds : lockWindowStarts(samples.length / sampleRate)) {
+        List<Double> windowStarts = lockWindowStarts(samples.length / sampleRate);
+        for (int i = 0; i < windowStarts.size(); i++) {
+            double startSeconds = windowStarts.get(i);
+            Double nextStartSeconds = i + 1 < windowStarts.size() ? windowStarts.get(i + 1) : null;
             long windowStartNanos = System.nanoTime();
             Map<String, WatermarkSearchEngine.UserScore> scores = searchAllRateGroups(
-                    rateGroups, sessionConfigs, hop, analysisSize, numBands, window, null, startSeconds);
+                    rateGroups, sessionConfigs, hop, analysisSize, numBands, window, null, startSeconds,
+                    WINDOW_SCORE_SECONDS, nextStartSeconds);
             WatermarkDetectionResponse response = buildDetectionResponse(
                     scores, sessionConfigs, userDisplayNames, sessionId, numFrames,
                     String.format("full search from %.1f s", startSeconds));
@@ -299,8 +317,12 @@ public class WatermarkDetectionService {
         return starts;
     }
 
-    /** Users whose embedders ran at one sample rate, and the recording decoded at that rate. */
-    private record RateGroup(int sampleRate, float[] samples, int[] binToBand, List<DetectionConfigView> configs) {}
+    /**
+     * Users whose embedders ran at one sample rate, the recording decoded at
+     * that rate, and the stage-1 work its lock windows share.
+     */
+    private record RateGroup(int sampleRate, float[] samples, int[] binToBand, List<DetectionConfigView> configs,
+                             WatermarkSearchEngine.Stage1Cache stage1Cache) {}
 
     private List<RateGroup> buildRateGroups(
             List<DetectionConfigView> sessionConfigs, WatermarkAudioDecoder.DecodedAudio decoded,
@@ -325,7 +347,8 @@ public class WatermarkDetectionService {
                     ? decoded.samples
                     : audioDecoder.decodeAtRate(fileBytes, filename, rate).samples;
             groups.add(new RateGroup(
-                    rate, samples, WatermarkDsp.buildBinToBandMap(analysisSize, rate, numBands), entry.getValue()));
+                    rate, samples, WatermarkDsp.buildBinToBandMap(analysisSize, rate, numBands), entry.getValue(),
+                    new WatermarkSearchEngine.Stage1Cache()));
         }
         return groups;
     }
@@ -333,25 +356,37 @@ public class WatermarkDetectionService {
     /**
      * One search pass per rate group, locking from {@code startSeconds} into
      * the recording, merged back into registration order. Scores are
-     * comparable across groups.
+     * comparable across groups. A full-search window shares stage-1 work
+     * with the window after it, which starts at {@code nextStartSeconds}
+     * (null if there's none).
      */
     private Map<String, WatermarkSearchEngine.UserScore> searchAllRateGroups(
             List<RateGroup> groups, List<DetectionConfigView> sessionConfigs,
-            int hop, int analysisSize, int numBands, float[] window, Long cyclePosLimit, double startSeconds) {
+            int hop, int analysisSize, int numBands, float[] window, Long cyclePosLimit, double startSeconds,
+            Double maxScoreSeconds, Double nextStartSeconds) {
 
         Map<String, WatermarkSearchEngine.UserScore> scoresByUser = new HashMap<>();
         for (RateGroup g : groups) {
-            int start = Math.min(g.samples().length, (int) Math.round(startSeconds * g.sampleRate()));
+            int start = sampleAt(startSeconds, g, hop);
             float[] samples = start == 0 ? g.samples() : Arrays.copyOfRange(g.samples(), start, g.samples().length);
+            WatermarkSearchEngine.LockWindow lockWindow = cyclePosLimit != null ? null
+                    : new WatermarkSearchEngine.LockWindow(g.stage1Cache(), start,
+                            nextStartSeconds == null ? Integer.MAX_VALUE : sampleAt(nextStartSeconds, g, hop));
             scoresByUser.putAll(searchEngine.findBestScoresAcrossUsers(
                     samples, g.configs(), hop, analysisSize, numBands, g.sampleRate(),
-                    window, g.binToBand(), cyclePosLimit));
+                    window, g.binToBand(), cyclePosLimit, maxScoreSeconds, lockWindow));
         }
         Map<String, WatermarkSearchEngine.UserScore> ordered = new LinkedHashMap<>();
         for (DetectionConfigView c : sessionConfigs) {
             ordered.put(c.getUserId(), scoresByUser.get(c.getUserId()));
         }
         return ordered;
+    }
+
+    /** Where a lock window starts in this group's samples, on the search's phase grid. */
+    private static int sampleAt(double seconds, RateGroup g, int hop) {
+        return WatermarkSearchEngine.alignToPhaseGrid(
+                Math.min(g.samples().length, (int) Math.round(seconds * g.sampleRate())), hop);
     }
 
     /** Users ranked strongest first, and which of them reach MIN_CONSISTENCY. */

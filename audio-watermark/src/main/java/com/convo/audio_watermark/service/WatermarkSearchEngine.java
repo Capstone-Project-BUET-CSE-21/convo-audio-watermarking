@@ -307,6 +307,18 @@ class WatermarkSearchEngine {
     private static final int DRIFT_REACQUIRE_RADIUS = 1024;
 
     /**
+     * When stage 3 is bounded (findBestScoresAcrossUsers' maxScoreSeconds —
+     * the full search's retry windows are, so their cost doesn't grow with
+     * recording length), a user whose bounded consistency reaches this is
+     * re-scored over everything after the lock, keeping the stronger of the
+     * two. A steady but weak watermark gains consistency with more audio
+     * (it grows with sqrt(frames)); a watermark present only in one stretch
+     * loses it (the rest dilutes it), which is why the stronger one is
+     * kept. Noise stays below this almost always, so the extra cost is rare.
+     */
+    private static final double EXTEND_SCORE_MIN_CONSISTENCY = 3.0;
+
+    /**
      * WHY DETECTION WORKS AT ~2s BUT DEGRADES/INVERTS BY ~5s (duration
      * accumulation): the earlier drift tracker corrected phase
      * INCREMENTALLY off a CUMULATIVE running offset — each block searched
@@ -458,6 +470,71 @@ class WatermarkSearchEngine {
         }
     }
 
+    /**
+     * Stage-1 work shared between the full search's lock windows over one
+     * recording (see WatermarkDetectionService.MAX_LOCK_WINDOWS). On a
+     * short recording the windows start 0.5s apart but each searches
+     * SEARCH_FRAME_COUNT frames (~0.85s), so ~40% of a window's frames were
+     * already scored by the window before it. From its third frame on, a
+     * frame's term against a PN position doesn't depend on where the window
+     * started (see WatermarkDsp.spectralFrameTerm), so those terms are kept
+     * here, keyed by where the frame sits in the recording, and reused
+     * bit-for-bit: sharing changes speed, not a single score.
+     *
+     * Holds only frames a later window will reach — ~13MB per user at 0.5s
+     * spacing, nothing once windows stop overlapping. One per recording (per
+     * sample rate) per request. Its stage-1 phase tasks use it concurrently,
+     * but never the same frame: each phase reads different samples.
+     */
+    static final class Stage1Cache {
+        // userId -> absolute sample offset of a frame's hop -> the frame's term for every PN position
+        private final Map<String, Map<Integer, double[]>> termsByUser = new ConcurrentHashMap<>();
+
+        /** Removes and returns the cached terms, since no later window reads the same frame at the same phase. */
+        private double[] take(String userId, int frameSample) {
+            Map<Integer, double[]> terms = termsByUser.get(userId);
+            return terms == null ? null : terms.remove(frameSample);
+        }
+
+        private void put(String userId, int frameSample, double[] terms) {
+            termsByUser.computeIfAbsent(userId, id -> new ConcurrentHashMap<>()).put(frameSample, terms);
+        }
+
+        private void dropBefore(int sample) {
+            for (Map<Integer, double[]> terms : termsByUser.values()) {
+                terms.keySet().removeIf(frameSample -> frameSample < sample);
+            }
+        }
+
+        /** Frames held, summed over users. */
+        int size() {
+            int size = 0;
+            for (Map<Integer, double[]> terms : termsByUser.values()) size += terms.size();
+            return size;
+        }
+    }
+
+    /**
+     * Where one full-search lock window sits in its recording, for
+     * Stage1Cache: the samples searched start at {@code startSample}, and
+     * the next window at {@code nextStartSample} (Integer.MAX_VALUE if this
+     * is the last), so only frames from there on are worth keeping.
+     */
+    record LockWindow(Stage1Cache cache, int startSample, int nextStartSample) {}
+
+    /**
+     * Rounds a lock window's start down onto stage 1's phase grid (by a few
+     * samples at most), so that overlapping windows search exactly the same
+     * frames and can share them, whatever their spacing and sample rate.
+     */
+    static int alignToPhaseGrid(int startSample, int hop) {
+        return startSample - startSample % phaseStride(hop);
+    }
+
+    private static int phaseStride(int hop) {
+        return Math.max(1, hop / PHASE_COARSE_CANDIDATES);
+    }
+
     /** Thread-safe "keep if better" update — multiple chunks for the same user can finish concurrently. */
     private static void updateBestAlignment(BestAlignment ba, double score, int phase, long cyclePos) {
         synchronized (ba) {
@@ -493,18 +570,32 @@ class WatermarkSearchEngine {
      *                      still 6 hops shy of hopsPerCycle — a
      *                      forward-only window scored that case as pure
      *                      noise and let another user's noise ceiling win.
+     * @param maxScoreSeconds if non-null, stage 3 scores at most this much
+     *                      audio after the lock instead of everything after
+     *                      it, so a caller that searches from many start
+     *                      points doesn't pay for the rest of the recording
+     *                      each time. Users whose bounded score looks
+     *                      promising are re-scored in full (see
+     *                      EXTEND_SCORE_MIN_CONSISTENCY). Null scores
+     *                      everything.
+     * @param lockWindow    if non-null, where {@code samples} sits in the
+     *                      recording, so an exhaustive search can reuse and
+     *                      keep stage-1 work (see Stage1Cache).
      */
     Map<String, UserScore> findBestScoresAcrossUsers(
             float[] samples,
             List<DetectionConfigView> sessionConfigs,
             int hop, int analysisSize, int numBands, float sampleRate,
-            float[] window, int[] binToBand, Long cyclePosLimit) {
+            float[] window, int[] binToBand, Long cyclePosLimit, Double maxScoreSeconds, LockWindow lockWindow) {
 
         long searchStartNanos = System.nanoTime();
         int numDetectorFrames = samples.length / hop;
+        int maxScoredFrames = maxScoreSeconds == null
+                ? Integer.MAX_VALUE
+                : (int) Math.round(maxScoreSeconds * sampleRate / hop);
         int searchFrameCount = Math.min(SEARCH_FRAME_COUNT, numDetectorFrames);
 
-        int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
+        int phaseStride = phaseStride(hop);
         // Stages 1/2 never synthesize more than searchFrameCount frames per
         // candidate (stage 3 allocates its own block-sized buffers), so size
         // each task's scratch reconstruction to that, NOT to the whole
@@ -528,14 +619,13 @@ class WatermarkSearchEngine {
                     WatermarkDsp.resolveSeed(c.getSeed()), hopsPerCycle, analysisSize));
         }
 
-        // ── Stage 1: coarse phase scan × EXHAUSTIVE cyclePos scan. The
-        //    audio-side masking analysis for a given phase is
-        //    shared/sequential (cheap, one FFT pass over SEARCH_FRAME_COUNT
-        //    frames); for
-        //    each user at that phase, the cyclePos range is split into
-        //    numWorkers chunks and every chunk — across every user — is
-        //    submitted as its own independent task, so parallelism scales
-        //    with core count, not with how many people were in the call.
+        // ── Stage 1: coarse phase scan × EXHAUSTIVE cyclePos scan. Each
+        //    phase is one task: the audio-side masking analysis for that
+        //    phase (shared by every user and candidate), then every user's
+        //    candidates at that phase. The analysis used to run on the
+        //    request thread between phases, with the candidates split into
+        //    chunks across the pool — which left every other core idle for
+        //    ~40% of the stage once candidates got cheap (see below).
         //
         //    cyclePos MUST be scanned exhaustively (stride 1) — see the
         //    class doc for why a subsampled grid can't work here. This
@@ -554,77 +644,23 @@ class WatermarkSearchEngine {
         //    makes retrying from several lock windows affordable. It ranks
         //    candidates; stage 2 then re-scores the winner's neighbourhood
         //    with the exact time-domain score. (Falls back to exact scoring
-        //    if a config ever uses other than 50% frame overlap.)
+        //    if a config ever uses other than 50% frame overlap.) The
+        //    exhaustive search computes the same scores frame by frame
+        //    instead, so lock windows can share them (see scorePhaseByFrames).
+        List<CompletableFuture<Void>> phaseFutures = new ArrayList<>();
         for (int phase = 0; phase < hop; phase += phaseStride) {
             int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
             if (framesAvailable <= 0) continue;
-
-            WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
-                    samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
-            WatermarkDsp.SpectralFrames spectral = analysisSize == 2 * hop
-                    ? WatermarkDsp.buildSpectralFrames(
-                            samples, phase, analysis, framesAvailable, hop, analysisSize, window, binToBand)
-                    : null;
-
             final int phaseF = phase;
-            final int framesAvailableF = framesAvailable;
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-
-            for (DetectionConfigView c : sessionConfigs) {
-                long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                // wrapLimit > 0 means the candidate set is two disjoint
-                // windows — [0, wrapLimit) and (hopsPerCycle - wrapLimit,
-                // hopsPerCycle) — rather than one contiguous range. Once the
-                // requested limit covers at least half the cycle the two
-                // windows would overlap/duplicate, so fall back to a single
-                // exhaustive [0, hopsPerCycle) range instead.
-                long wrapLimit = 0;
-                long totalCandidates;
-                if (cyclePosLimit != null && 2 * Math.min(cyclePosLimit, hopsPerCycle) < hopsPerCycle) {
-                    wrapLimit = Math.min(cyclePosLimit, hopsPerCycle);
-                    totalCandidates = 2 * wrapLimit;
-                } else {
-                    totalCandidates = hopsPerCycle;
-                }
-                final long wrapLimitF = wrapLimit;
-                int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
-                long chunkSize = (totalCandidates + chunks - 1) / chunks;
-                BestAlignment ba = bestByUser.get(c.getUserId());
-                WatermarkDsp.PnSpectra pn = pnByUser.get(c.getUserId());
-                double marginLinear = Math.pow(10.0, c.getAlpha() / 20.0);
-
-                for (int ci = 0; ci < chunks; ci++) {
-                    long startIdx = (long) ci * chunkSize;
-                    long endIdxExclusive = Math.min(totalCandidates, startIdx + chunkSize);
-                    if (startIdx >= endIdxExclusive) continue;
-
-                    futures.add(CompletableFuture.runAsync(() -> {
-                        ScratchBuffers buffers = spectral == null ? new ScratchBuffers(analysisSize, maxReconLen) : null;
-                        double localBestScore = Double.NEGATIVE_INFINITY;
-                        long localBestCyclePos = 0;
-
-                        for (long idx = startIdx; idx < endIdxExclusive; idx++) {
-                            // idx < wrapLimitF -> forward window [0, wrapLimitF).
-                            // Otherwise -> backward/wraparound window
-                            // (hopsPerCycle - wrapLimitF, hopsPerCycle).
-                            // wrapLimitF == 0 means no split: idx IS the cyclePos.
-                            long cyclePos = (wrapLimitF == 0 || idx < wrapLimitF)
-                                    ? idx
-                                    : hopsPerCycle - wrapLimitF + (idx - wrapLimitF);
-                            double score = spectral != null
-                                    ? WatermarkDsp.scoreSpectral(spectral, pn, cyclePos, hopsPerCycle, marginLinear)
-                                    : scoreCandidate(samples, phaseF, analysis, c, pn, cyclePos, hopsPerCycle, hop,
-                                            analysisSize, numBands, window, binToBand, framesAvailableF, buffers);
-                            if (score > localBestScore) {
-                                localBestScore = score;
-                                localBestCyclePos = cyclePos;
-                            }
-                        }
-                        updateBestAlignment(ba, localBestScore, phaseF, localBestCyclePos);
-                    }, userScoringExecutor));
-                }
-            }
-            futures.forEach(future -> future.join());
+            phaseFutures.add(CompletableFuture.runAsync(() -> searchPhase(
+                    samples, phaseF, framesAvailable, sessionConfigs, bestByUser, hopsPerCycleByUser, pnByUser,
+                    hop, analysisSize, numBands, window, binToBand, cyclePosLimit, maxReconLen, lockWindow),
+                    userScoringExecutor));
+        }
+        phaseFutures.forEach(future -> future.join());
+        if (lockWindow != null) {
+            // Whatever the next window can't reach (e.g. frames it reads at a different phase).
+            lockWindow.cache().dropBefore(lockWindow.nextStartSample());
         }
         long stage1Nanos = System.nanoTime();
         log.info("watermark-detect[{}] stage1 (coarse phase x cyclePos scan) took {} ms",
@@ -723,7 +759,16 @@ class WatermarkSearchEngine {
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
                 UserScore score = driftTrackedFinalScore(
                         samples, ba.phase, ba.cyclePos, c, pnByUser.get(c.getUserId()), hopsPerCycle, hop,
-                        analysisSize, numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount);
+                        analysisSize, numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount,
+                        maxScoredFrames);
+                boolean audioBeyondBound = numDetectorFrames - ba.phase / hop - searchFrameCount > maxScoredFrames;
+                if (audioBeyondBound && score.consistency() >= EXTEND_SCORE_MIN_CONSISTENCY) {
+                    UserScore full = driftTrackedFinalScore(
+                            samples, ba.phase, ba.cyclePos, c, pnByUser.get(c.getUserId()), hopsPerCycle, hop,
+                            analysisSize, numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount,
+                            Integer.MAX_VALUE);
+                    if (full.consistency() > score.consistency()) score = full;
+                }
                 finalScores.put(c.getUserId(), score);
             }, userScoringExecutor));
         }
@@ -741,6 +786,134 @@ class WatermarkSearchEngine {
             ordered.put(c.getUserId(), finalScores.get(c.getUserId()));
         }
         return ordered;
+    }
+
+    /**
+     * Stage 1 at one phase, run as one pool task: the audio-side analysis at
+     * that phase, then each user's best cyclePos there — every cyclePos for
+     * the exhaustive search, or those within cyclePosLimit of 0 (in either
+     * direction, see findBestScoresAcrossUsers) for the fast path.
+     */
+    private void searchPhase(
+            float[] samples, int phase, int framesAvailable, List<DetectionConfigView> sessionConfigs,
+            Map<String, BestAlignment> bestByUser, Map<String, Long> hopsPerCycleByUser,
+            Map<String, WatermarkDsp.PnSpectra> pnByUser, int hop, int analysisSize, int numBands, float[] window,
+            int[] binToBand, Long cyclePosLimit, int maxReconLen, LockWindow lockWindow) {
+
+        WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
+                samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
+        WatermarkDsp.SpectralFrames spectral = analysisSize == 2 * hop
+                ? WatermarkDsp.buildSpectralFrames(
+                        samples, phase, analysis, framesAvailable, hop, analysisSize, window, binToBand)
+                : null;
+        ScratchBuffers buffers = spectral == null ? new ScratchBuffers(analysisSize, maxReconLen) : null;
+
+        for (DetectionConfigView c : sessionConfigs) {
+            long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
+            WatermarkDsp.PnSpectra pn = pnByUser.get(c.getUserId());
+            BestAlignment ba = bestByUser.get(c.getUserId());
+            if (spectral != null && cyclePosLimit == null) {
+                scorePhaseByFrames(spectral, phase, hop, c, Math.toIntExact(hopsPerCycle), pn, ba, lockWindow);
+                continue;
+            }
+
+            // wrapLimit > 0 means the candidate set is two disjoint
+            // windows — [0, wrapLimit) and (hopsPerCycle - wrapLimit,
+            // hopsPerCycle) — rather than one contiguous range. Once the
+            // requested limit covers at least half the cycle the two
+            // windows would overlap/duplicate, so fall back to a single
+            // exhaustive [0, hopsPerCycle) range instead.
+            long wrapLimit = 0;
+            long totalCandidates;
+            if (cyclePosLimit != null && 2 * Math.min(cyclePosLimit, hopsPerCycle) < hopsPerCycle) {
+                wrapLimit = Math.min(cyclePosLimit, hopsPerCycle);
+                totalCandidates = 2 * wrapLimit;
+            } else {
+                totalCandidates = hopsPerCycle;
+            }
+            double marginLinear = Math.pow(10.0, c.getAlpha() / 20.0);
+            double bestScore = Double.NEGATIVE_INFINITY;
+            long bestCyclePos = 0;
+            for (long idx = 0; idx < totalCandidates; idx++) {
+                // idx < wrapLimit -> forward window [0, wrapLimit).
+                // Otherwise -> backward/wraparound window
+                // (hopsPerCycle - wrapLimit, hopsPerCycle).
+                // wrapLimit == 0 means no split: idx IS the cyclePos.
+                long cyclePos = (wrapLimit == 0 || idx < wrapLimit)
+                        ? idx
+                        : hopsPerCycle - wrapLimit + (idx - wrapLimit);
+                double score = spectral != null
+                        ? WatermarkDsp.scoreSpectral(spectral, pn, cyclePos, hopsPerCycle, marginLinear)
+                        : scoreCandidate(samples, phase, analysis, c, pn, cyclePos, hopsPerCycle, hop,
+                                analysisSize, numBands, window, binToBand, framesAvailable, buffers);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestCyclePos = cyclePos;
+                }
+            }
+            updateBestAlignment(ba, bestScore, phase, bestCyclePos);
+        }
+    }
+
+    /**
+     * One user's exhaustive stage 1 at one phase, frame by frame: each
+     * frame's term against every PN position (WatermarkDsp.spectralFrameTerm),
+     * added into the running score of every cyclePos candidate that matches
+     * that frame to that position. Across a whole cycle of candidates each
+     * frame meets every PN position exactly once, so this is the same work
+     * as scoring candidate by candidate (WatermarkDsp.scoreSpectral), and the
+     * same arithmetic in the same order, so the same scores to the last bit.
+     * What it adds is that a frame's terms outlive the window, for the next
+     * one to reuse (see Stage1Cache).
+     */
+    private static void scorePhaseByFrames(
+            WatermarkDsp.SpectralFrames spectral, int phase, int hop, DetectionConfigView config, int hopsPerCycle,
+            WatermarkDsp.PnSpectra pn, BestAlignment ba, LockWindow lockWindow) {
+
+        String userId = config.getUserId();
+        double marginLinear = Math.pow(10.0, config.getAlpha() / 20.0);
+        double[] totals = new double[hopsPerCycle];
+        int[] scored = new int[hopsPerCycle];
+        for (int f = 0; f < spectral.frames; f++) {
+            double[] terms = null;
+            int frameSample = -1; // where the frame sits in the recording, if it can be shared
+            if (lockWindow != null && f >= 2) { // frames 0 and 1 depend on where this window starts
+                frameSample = lockWindow.startSample() + phase + f * hop;
+                terms = lockWindow.cache().take(userId, frameSample);
+            }
+            if (terms == null) {
+                terms = new double[hopsPerCycle];
+                for (int cp = 0; cp < hopsPerCycle; cp++) {
+                    terms[cp] = WatermarkDsp.spectralFrameTerm(spectral, pn, f, cp, hopsPerCycle, marginLinear);
+                }
+            }
+            if (lockWindow != null && frameSample >= lockWindow.nextStartSample()) {
+                lockWindow.cache().put(userId, frameSample, terms);
+            }
+
+            // Candidate cyclePos matches frame f to PN position cyclePos + f.
+            int shift = f % hopsPerCycle;
+            for (int cyclePos = 0; cyclePos < hopsPerCycle; cyclePos++) {
+                int cp = cyclePos + shift;
+                if (cp >= hopsPerCycle) cp -= hopsPerCycle;
+                double term = terms[cp];
+                if (!Double.isNaN(term)) { // a silent hop isn't scored
+                    totals[cyclePos] += term;
+                    scored[cyclePos]++;
+                }
+            }
+        }
+
+        double bestScore = Double.NEGATIVE_INFINITY;
+        long bestCyclePos = 0;
+        for (int cyclePos = 0; cyclePos < hopsPerCycle; cyclePos++) {
+            double score = scored[cyclePos] > 0 ? totals[cyclePos] / scored[cyclePos] : 0.0;
+            if (score > bestScore) {
+                bestScore = score;
+                bestCyclePos = cyclePos;
+            }
+        }
+        updateBestAlignment(ba, bestScore, phase, bestCyclePos);
     }
 
     private double scoreCandidate(
@@ -790,7 +963,7 @@ class WatermarkSearchEngine {
             float[] samples, int lockPhase, long lockCyclePos,
             DetectionConfigView config, WatermarkDsp.PnSpectra pn, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
-            float sampleRate, String userId, int lockSearchFrames) {
+            float sampleRate, String userId, int lockSearchFrames, int maxScoredFrames) {
 
         // ── Held-out starting point: skip the EXACT frames stage 1/2 used
         //    to CHOOSE (lockPhase, lockCyclePos) via their own argmax
@@ -831,7 +1004,7 @@ class WatermarkSearchEngine {
         int blocksLocked = 0, blocksCoasted = 0, blocksReacquired = 0;
         int frameIndex = 0; // logical frames elapsed since the held-out start
 
-        while (true) {
+        while (frameIndex < maxScoredFrames) {
             // ── ABSOLUTE predicted read offset for this block from the
             //    original lock + fitted drift — NOT a running cumulative
             //    offset, so a bad block can't corrupt any later block.

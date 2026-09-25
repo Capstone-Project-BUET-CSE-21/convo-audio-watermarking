@@ -91,15 +91,18 @@ participants qualify, the strongest is named and the others are listed in
 
 In-app recordings are usually found by a fast search near the start of the
 watermark's cycle. Everything else goes to an exhaustive search. If the search
-from the start of the recording finds nothing, it's retried from up to 7 later
-points spread across the recording (at least 2 s apart), stopping at the first
-detection. Phone recordings often only lock from part of the recording, so a
-recording with no detectable watermark costs up to 8 times as much.
+from the start of the recording finds nothing, it's retried every 0.5 s (at
+most 24 times, spread evenly over longer recordings), stopping at the first
+detection. Phone recordings often lock only from short stretches, sometimes
+narrower than 1.5 s, so a recording with no detectable watermark pays for every
+retry. To keep that affordable, each retry scores at most 10 s of audio unless
+its result looks promising, and retries that overlap reuse each other's work.
 
-Measured on an 8-core machine with two participants: 1.5 s for an in-app
-recording, and 6–13 s for 10–18 s phone recordings, including ones that need
-every retry. A small cloud instance with a fraction of a CPU will be several
-times slower.
+Measured on an 8-core laptop with two participants: about 1.5 s for an in-app
+recording, 4–9 s for phone recordings that detect, 15–30 s for 10–16 s
+recordings with no detectable watermark, and about 42 s for 60 s of audio with
+none. A small cloud instance with a fraction of a CPU will be several times
+slower.
 
 ---
 

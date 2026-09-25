@@ -71,10 +71,11 @@ class WatermarkDecisionTests {
     @Test
     void lockWindowsSpreadAcrossTheRecording() {
         assertThat(WatermarkDetectionService.lockWindowStarts(2.0)).containsExactly(0.0); // too short to retry
-        assertThat(WatermarkDetectionService.lockWindowStarts(9.8)).containsExactly(0.0, 2.0, 4.0, 6.0);
+        assertThat(WatermarkDetectionService.lockWindowStarts(9.8)).containsExactly(
+                0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0);
         List<Double> longRecording = WatermarkDetectionService.lockWindowStarts(300.0);
-        assertThat(longRecording).hasSize(8).startsWith(0.0);
-        assertThat(longRecording.get(7)).isCloseTo(297.5, within(1e-9));
+        assertThat(longRecording).hasSize(24).startsWith(0.0);
+        assertThat(longRecording.get(23)).isCloseTo(297.5, within(1e-9));
     }
 
     @Test
