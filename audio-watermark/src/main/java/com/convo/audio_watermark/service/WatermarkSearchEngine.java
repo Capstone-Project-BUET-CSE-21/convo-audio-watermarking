@@ -283,6 +283,21 @@ class WatermarkSearchEngine {
     private static final double DRIFT_FIT_MAX_RESIDUAL = 10.0;
 
     /**
+     * How far (in samples, either direction) a block searches when it fails
+     * to lock near its prediction, before giving up on it. Real recordings
+     * don't only drift smoothly, they JUMP: browsers move live audio between
+     * components in 10 ms chunks (480 samples at 48kHz), and a hand-off that
+     * drops or repeats one shifts everything after it by exactly that much.
+     * Measured on a real in-app recording: one +480-sample jump ~1.2s in,
+     * then perfectly aligned to the end. The ±DRIFT_PHASE_RADIUS search can
+     * never follow that, so without this the watermark is lost for the rest
+     * of the recording. 1024 covers up to two chunks either way plus margin.
+     * The search reuses the block's existing reconstruction (dot products
+     * only, no FFT), so it's cheap enough to run on every unlocked block.
+     */
+    private static final int DRIFT_REACQUIRE_RADIUS = 1024;
+
+    /**
      * WHY DETECTION WORKS AT ~2s BUT DEGRADES/INVERTS BY ~5s (duration
      * accumulation): the earlier drift tracker corrected phase
      * INCREMENTALLY off a CUMULATIVE running offset — each block searched
@@ -784,7 +799,7 @@ class WatermarkSearchEngine {
         DriftFit drift = new DriftFit(DRIFT_MAX_PPM * 1e-6 * hop);
 
         WatermarkDsp.ScoreDetail total = WatermarkDsp.ScoreDetail.zero();
-        int blocksLocked = 0, blocksCoasted = 0;
+        int blocksLocked = 0, blocksCoasted = 0, blocksReacquired = 0;
         int frameIndex = 0; // logical frames elapsed since the held-out start
 
         while (true) {
@@ -798,16 +813,6 @@ class WatermarkSearchEngine {
             int framesThisBlock = Math.min(blockFrames, framesRemaining);
 
             long cyclePos = (holdoutCyclePos + frameIndex) % hopsPerCycle;
-
-            // ── ONE FFT-based pass per block: masking analysis + PN
-            //    synthesis at the predicted offset. Reused below for BOTH
-            //    the local search and the final score — never recomputed
-            //    per candidate.
-            WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
-                    samples, predictedPhase, hop, analysisSize, numBands, window, binToBand, framesThisBlock);
-            WatermarkDsp.synthesizeRecon(
-                    analysis, pn, cyclePos, hopsPerCycle, hop, analysisSize,
-                    window, binToBand, marginLinear, framesThisBlock, pnRe, pnIm, recon);
 
             // ── Per-block search/score split: the local re-lock search
             //    below only ever looks at the block's FIRST searchFrames
@@ -823,54 +828,43 @@ class WatermarkSearchEngine {
                 scoreFrameCount = framesThisBlock;
             }
 
-            // ── Local re-lock probe around the PREDICTED offset: slide the
-            //    SAME reconstruction against the recording at nearby sample
-            //    offsets, using ONLY the search portion. Pure dot-product
-            //    correlation, no FFT. This now only mops up the small
-            //    residual between the slope prediction and truth (and
-            //    supplies fresh confident points to the slope fit).
-            int bestOffset = predictedPhase;
-            double bestScore = Double.NEGATIVE_INFINITY;
-            for (int d = -DRIFT_PHASE_RADIUS; d <= DRIFT_PHASE_RADIUS; d++) {
-                int candidateOffset = predictedPhase + d;
-                if (candidateOffset < 0 || (samples.length - candidateOffset) / hop < searchFrames) continue;
-                double score = WatermarkDsp.correlateOnly(
-                        samples, candidateOffset, recon, hop, 0, searchFrames).average();
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestOffset = candidateOffset;
+            BlockLock lock = lockBlock(samples, predictedPhase, cyclePos, hopsPerCycle, framesThisBlock,
+                    searchFrames, scoreStartFrame, scoreFrameCount, pn, hop, analysisSize, numBands,
+                    window, binToBand, marginLinear, pnRe, pnIm, recon);
+
+            // ── Re-acquisition (see DRIFT_REACQUIRE_RADIUS): no lock near
+            //    the prediction can mean the audio JUMPED rather than faded.
+            //    Search much wider with the reconstruction just built, and if
+            //    the block locks cleanly there, take that result and restart
+            //    the drift model from it. The retry is only accepted when its
+            //    own held-out frames confirm it (same gate as any lock), so
+            //    for pure noise this almost never replaces the local result.
+            boolean reacquired = false;
+            if (!lock.confident()) {
+                int wide = bestSearchOffset(samples, predictedPhase, DRIFT_REACQUIRE_RADIUS, recon, hop, searchFrames);
+                if (Math.abs(wide - predictedPhase) > DRIFT_PHASE_RADIUS - 2
+                        && (samples.length - wide) / hop >= framesThisBlock) {
+                    BlockLock retry = lockBlock(samples, wide, cyclePos, hopsPerCycle, framesThisBlock,
+                            searchFrames, scoreStartFrame, scoreFrameCount, pn, hop, analysisSize, numBands,
+                            window, binToBand, marginLinear, pnRe, pnIm, recon);
+                    if (retry.confident()) {
+                        lock = retry;
+                        reacquired = true;
+                    }
                 }
             }
 
-            // ── Score this block using the DISJOINT, held-out portion, at
-            //    the block's OWN search-portion argmax (bestOffset). This
-            //    captures a real but sub-confidence peak wherever it landed
-            //    inside the search window — which is the common case for a
-            //    weak phone/MP3 watermark and is exactly what the earlier
-            //    "score at the prediction unless confident" version missed,
-            //    leaving weak-but-real blocks scored off-peak. It stays
-            //    unbiased because bestOffset was chosen on the search
-            //    frames while the score uses the DISJOINT held-out frames
-            //    (see the per-block split above): the offset that maximizes
-            //    correlation on one set carries no information that inflates
-            //    correlation on the other, so a pure-noise block's random
-            //    argmax scores ~0 here rather than a spurious positive.
-            WatermarkDsp.ScoreDetail detail = WatermarkDsp.correlateOnly(
-                    samples, bestOffset, recon, hop, scoreStartFrame, scoreFrameCount);
-            total = WatermarkDsp.ScoreDetail.combine(total, detail);
-
-            // ── Lock gate (see DRIFT_LOCK_MIN_TSTAT): only a block whose
-            //    held-out frames confirm its chosen offset, and whose offset
-            //    isn't pinned at the window edge, feeds the drift model.
-            //    Every block is SCORED either way (just above); weak or
-            //    noise blocks just don't get a vote in where later blocks
-            //    look. Only meaningful when the scored frames really were
-            //    disjoint from the searched ones (scoreStartFrame > 0).
-            boolean interior = Math.abs(bestOffset - predictedPhase) <= DRIFT_PHASE_RADIUS - 2;
-            boolean confident = scoreStartFrame > 0 && interior
-                    && detail.detectionStat() >= DRIFT_LOCK_MIN_TSTAT;
-            if (confident) {
-                drift.add(frameIndex, bestOffset - (holdoutPhase + (double) frameIndex * hop));
+            // Every block is SCORED (see lockBlock); only confident ones
+            // steer where later blocks look.
+            total = WatermarkDsp.ScoreDetail.combine(total, lock.heldOut());
+            if (lock.confident()) {
+                double observedDrift = lock.offset() - (holdoutPhase + (double) frameIndex * hop);
+                if (reacquired) {
+                    drift.restart(frameIndex, observedDrift);
+                    blocksReacquired++;
+                } else {
+                    drift.add(frameIndex, observedDrift);
+                }
                 blocksLocked++;
             } else {
                 blocksCoasted++;
@@ -880,10 +874,10 @@ class WatermarkSearchEngine {
         }
 
         double weighted = total.weightedAverage();
-        log.info("watermark-detect user={} drift-tracking: {} block(s) locked, {} coasted, "
+        log.info("watermark-detect user={} drift-tracking: {} block(s) locked ({} after a jump), {} coasted, "
                         + "drift={} samp + {} samp/frame ({} ppm), weightedScore={}, detStat={}, "
                         + "simpleAvgScore={} (held-out frames={})",
-                userId, blocksLocked, blocksCoasted,
+                userId, blocksLocked, blocksReacquired, blocksCoasted,
                 String.format("%.1f", drift.intercept()),
                 String.format("%.5f", drift.slope()),
                 String.format("%.0f", drift.slope() / hop * 1e6),
@@ -893,19 +887,91 @@ class WatermarkSearchEngine {
         return weighted;
     }
 
+    /** One block's lock attempt: the chosen offset, its held-out score, and whether it passed the lock gate. */
+    private record BlockLock(int offset, WatermarkDsp.ScoreDetail heldOut, boolean confident) {}
+
     /**
-     * Straight-line clock-drift model: drift(F) = intercept + slope * F
-     * samples, least-squares fit through the confident blocks' observed
-     * drifts. After each new point, the point furthest from the line is
-     * dropped (and the line refit) while it's more than
-     * DRIFT_FIT_MAX_RESIDUAL off, so an occasional wrong lock can't bend
-     * the line. One point fixes only the intercept; the slope needs two.
+     * Locks one block around {@code center}. ONE FFT-based pass (masking
+     * analysis + PN synthesis at center, left in {@code recon} for the
+     * caller to reuse), a ±DRIFT_PHASE_RADIUS search on the block's search
+     * frames, then the held-out score at the winning offset.
+     *
+     * The block is scored at its OWN search-portion argmax. This captures a
+     * real but sub-confidence peak wherever it landed inside the search
+     * window, which is the common case for a weak phone/MP3 watermark. It
+     * stays unbiased because the offset was chosen on the search frames
+     * while the score uses the DISJOINT held-out frames: the offset that
+     * maximizes correlation on one set carries no information that inflates
+     * correlation on the other, so a pure-noise block's random argmax scores
+     * ~0 here rather than a spurious positive.
+     *
+     * Lock gate (see DRIFT_LOCK_MIN_TSTAT): only a block whose held-out
+     * frames confirm its chosen offset, and whose offset isn't pinned at the
+     * window edge, counts as confident. Only meaningful when the scored
+     * frames really were disjoint from the searched ones
+     * (scoreStartFrame > 0).
+     */
+    private BlockLock lockBlock(
+            float[] samples, int center, long cyclePos, long hopsPerCycle, int framesThisBlock,
+            int searchFrames, int scoreStartFrame, int scoreFrameCount, WatermarkDsp.PnSpectra pn,
+            int hop, int analysisSize, int numBands, float[] window, int[] binToBand, double marginLinear,
+            double[] pnRe, double[] pnIm, double[] recon) {
+
+        WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
+                samples, center, hop, analysisSize, numBands, window, binToBand, framesThisBlock);
+        WatermarkDsp.synthesizeRecon(
+                analysis, pn, cyclePos, hopsPerCycle, hop, analysisSize,
+                window, binToBand, marginLinear, framesThisBlock, pnRe, pnIm, recon);
+
+        int offset = bestSearchOffset(samples, center, DRIFT_PHASE_RADIUS, recon, hop, searchFrames);
+        WatermarkDsp.ScoreDetail heldOut = WatermarkDsp.correlateOnly(
+                samples, offset, recon, hop, scoreStartFrame, scoreFrameCount);
+        boolean interior = Math.abs(offset - center) <= DRIFT_PHASE_RADIUS - 2;
+        boolean confident = scoreStartFrame > 0 && interior
+                && heldOut.detectionStat() >= DRIFT_LOCK_MIN_TSTAT;
+        return new BlockLock(offset, heldOut, confident);
+    }
+
+    /**
+     * Slides an already-synthesized reconstruction against the recording at
+     * every offset within ±radius of center, scoring ONLY the search frames
+     * (pure dot-product correlation, no FFT), and returns the best offset
+     * (center itself if no offset in range is usable).
+     */
+    private static int bestSearchOffset(
+            float[] samples, int center, int radius, double[] recon, int hop, int searchFrames) {
+        int bestOffset = center;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int d = -radius; d <= radius; d++) {
+            int candidateOffset = center + d;
+            if (candidateOffset < 0 || (samples.length - candidateOffset) / hop < searchFrames) continue;
+            double score = WatermarkDsp.correlateOnly(
+                    samples, candidateOffset, recon, hop, 0, searchFrames).average();
+            if (score > bestScore) {
+                bestScore = score;
+                bestOffset = candidateOffset;
+            }
+        }
+        return bestOffset;
+    }
+
+    /**
+     * Piecewise-straight-line clock-drift model: drift(F) = intercept +
+     * slope * F samples, least-squares fit through the confident blocks'
+     * observed drifts since the last jump. After each new point, the point
+     * furthest from the line is dropped (and the line refit) while it's more
+     * than DRIFT_FIT_MAX_RESIDUAL off, so an occasional wrong lock can't bend
+     * the line. After a jump (see DRIFT_REACQUIRE_RADIUS), restart() drops
+     * the old segment's points, since the audio's offset moved as a block,
+     * but keeps its slope, since the clocks didn't change. A segment's first
+     * point fixes only the intercept; its slope needs two.
      */
     private static final class DriftFit {
         private final double maxSlope; // samples per frame
         private final List<double[]> points = new ArrayList<>(); // {F, observedDrift}
         private double intercept = 0.0;
         private double slope = 0.0;
+        private double priorSlope = 0.0; // used while the current segment has fewer than two points
 
         DriftFit(double maxSlope) {
             this.maxSlope = maxSlope;
@@ -935,6 +1001,12 @@ class WatermarkSearchEngine {
             }
         }
 
+        void restart(double frame, double observedDrift) {
+            priorSlope = slope;
+            points.clear();
+            add(frame, observedDrift);
+        }
+
         private void refit() {
             double meanF = 0.0, meanDrift = 0.0;
             for (double[] p : points) {
@@ -948,7 +1020,7 @@ class WatermarkSearchEngine {
                 sxx += (p[0] - meanF) * (p[0] - meanF);
                 sxy += (p[0] - meanF) * (p[1] - meanDrift);
             }
-            slope = sxx > 0.0 ? Math.max(-maxSlope, Math.min(maxSlope, sxy / sxx)) : 0.0;
+            slope = sxx > 0.0 ? Math.max(-maxSlope, Math.min(maxSlope, sxy / sxx)) : priorSlope;
             intercept = meanDrift - slope * meanF;
         }
     }
