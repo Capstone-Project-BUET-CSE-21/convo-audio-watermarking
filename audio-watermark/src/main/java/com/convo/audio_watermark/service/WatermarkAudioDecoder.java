@@ -4,7 +4,6 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
-import org.springframework.web.multipart.MultipartFile;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
@@ -30,8 +29,8 @@ class WatermarkAudioDecoder {
 
     private static final Logger log = LoggerFactory.getLogger(WatermarkAudioDecoder.class);
 
-    /** Sample rate FFmpeg resamples fallback-decoded audio to. */
-    private static final int TARGET_SAMPLE_RATE = 48000;
+    /** Sample rate ffmpeg decodes to when no specific rate is requested (see {@link #decode}). */
+    private static final int DEFAULT_SAMPLE_RATE = 48000;
 
     /** Max time to let a single ffmpeg transcode run before giving up. */
     private static final long FFMPEG_TIMEOUT_SECONDS = 60;
@@ -65,8 +64,12 @@ class WatermarkAudioDecoder {
         }
     }
 
-    DecodedAudio decode(MultipartFile audioFile) throws IOException, UnsupportedAudioFileException {
-        byte[] fileBytes = audioFile.getBytes();
+    /**
+     * Decodes at the file's own rate for WAV/AIFF/AU, or at
+     * {@link #DEFAULT_SAMPLE_RATE} for everything that has to go through ffmpeg.
+     */
+    DecodedAudio decode(byte[] fileBytes, String originalFilename)
+            throws IOException, UnsupportedAudioFileException {
 
         long startNanos = System.nanoTime();
         try {
@@ -75,11 +78,28 @@ class WatermarkAudioDecoder {
                     (System.nanoTime() - startNanos) / 1_000_000);
             return result;
         } catch (UnsupportedAudioFileException e) {
-            DecodedAudio result = decodeUsingFfmpeg(fileBytes, audioFile.getOriginalFilename());
+            DecodedAudio result = decodeUsingFfmpeg(fileBytes, originalFilename, DEFAULT_SAMPLE_RATE);
             log.info("watermark-decode: ffmpeg (MP3/AAC/M4A/Opus) path took {} ms",
                     (System.nanoTime() - startNanos) / 1_000_000);
             return result;
         }
+    }
+
+    /**
+     * Decodes any supported format resampled to exactly
+     * {@code targetSampleRate}, via ffmpeg. Used when the rate a watermark
+     * was embedded at differs from what {@link #decode} produced: the
+     * embedder's frame grid is defined in samples at ITS rate, so the
+     * recording must be brought back to that rate before searching.
+     */
+    DecodedAudio decodeAtRate(byte[] fileBytes, String originalFilename, int targetSampleRate)
+            throws IOException {
+
+        long startNanos = System.nanoTime();
+        DecodedAudio result = decodeUsingFfmpeg(fileBytes, originalFilename, targetSampleRate);
+        log.info("watermark-decode: ffmpeg resample to {} Hz took {} ms",
+                targetSampleRate, (System.nanoTime() - startNanos) / 1_000_000);
+        return result;
     }
 
     private DecodedAudio decodeUsingAudioSystem(byte[] fileBytes)
@@ -106,7 +126,8 @@ class WatermarkAudioDecoder {
         }
     }
 
-    private DecodedAudio decodeUsingFfmpeg(byte[] fileBytes, String originalFilename) throws IOException {
+    private DecodedAudio decodeUsingFfmpeg(byte[] fileBytes, String originalFilename, int targetSampleRate)
+            throws IOException {
 
         Path inputPath = Files.createTempFile("watermark-in-", extractExtension(originalFilename));
         Path outputPath = Files.createTempFile("watermark-out-", ".wav");
@@ -119,7 +140,7 @@ class WatermarkAudioDecoder {
                     "-y",
                     "-i", inputPath.toString(),
                     "-ac", "1",
-                    "-ar", String.valueOf(TARGET_SAMPLE_RATE),
+                    "-ar", String.valueOf(targetSampleRate),
                     "-f", "wav",
                     outputPath.toString());
 

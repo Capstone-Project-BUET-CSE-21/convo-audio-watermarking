@@ -15,7 +15,7 @@ import java.util.Map;
  * REST controller for the watermark detection endpoint.
  *
  * <pre>
- * POST /api/audio-watermark/detect
+ * POST /api/audio-watermark/detect   (no authentication required)
  *   Content-Type: multipart/form-data
  *   Parts:
  *     audio     – the audio file to analyse (WAV recommended)
@@ -23,14 +23,17 @@ import java.util.Map;
  *
  * Response 200:
  * {
- *   "detectedUser":       "u001",          // null if no watermark found
- *   "sessionId":          "abc123",
- *   "correlationScore":   0.9500,          // best candidate score, normalised [−1, +1]
- *   "watermarkDetected":  true,
- *   "totalFramesAnalyzed": 412,
- *   "totalUsersChecked":   3,
- *   "allUserScores": { "u001": 0.95, "u002": 0.02, "u003": -0.01 },
- *   "message":            "Watermark detected. Best match: user 'u001' ..."
+ *   "detectedUser":            "&lt;userId&gt;",  // null if no watermark found
+ *   "detectedUserDisplayName": "Alice",           // null if no watermark found
+ *   "sessionId":               "abc123",
+ *   "correlationScore":        0.2881,  // best user's energy-weighted score, in [−1, +1];
+ *                                       // genuine hits typically land ~0.02–0.5, wrong users ~0
+ *   "watermarkDetected":       true,
+ *   "totalFramesAnalyzed":     1125,
+ *   "totalUsersChecked":       3,
+ *   "allUserScores":    { "&lt;userId&gt;": 0.2881, ... },
+ *   "userDisplayNames": { "&lt;userId&gt;": "Alice", ... },
+ *   "message": "Watermark detected (near cyclePos=0 (either direction)). Detected user: 'Alice' | ..."
  * }
  * </pre>
  */

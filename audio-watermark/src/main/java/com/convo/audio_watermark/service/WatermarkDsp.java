@@ -42,6 +42,70 @@ final class WatermarkDsp {
     }
 
     /**
+     * The raw (pre-gain) FFT of the PN frame at every cyclePos of ONE seed.
+     *
+     * A frame's PN spectrum depends only on (seed, cyclePos) — never on the
+     * recorded audio, the phase being tested, or which candidate alignment
+     * asked for it — so a user has exactly hopsPerCycle distinct spectra
+     * (750 for a 4s cycle). The search, however, needs one per (phase,
+     * cyclePos candidate, frame): millions per user in the exhaustive pass,
+     * each costing 512 PRNG draws + a forward FFT. Building every distinct
+     * spectrum once up front turns all of that into a table lookup, leaving
+     * the inverse FFT (which DOES depend on the audio, via the masking
+     * gains) as the only FFT per synthesized frame.
+     *
+     * Stores the raw bins rather than unit phasors so {@link #synthesizeRecon}
+     * computes exactly the same floating-point operations as before
+     * (raw * (amp / mag)) — the cache changes speed, not a single bit of
+     * any score.
+     *
+     * Immutable once built; safe to share across concurrent search tasks.
+     */
+    static final class PnSpectra {
+        final int half;      // analysisSize / 2
+        final double[] re;   // [cyclePos * (half + 1) + k], k in [0, half] — includes the Nyquist bin
+        final double[] im;
+        final double[] mag;  // [cyclePos * half + k], k in [0, half) — |P_k| + 1e-12, the gain's denominator
+
+        private PnSpectra(int half, double[] re, double[] im, double[] mag) {
+            this.half = half;
+            this.re = re;
+            this.im = im;
+            this.mag = mag;
+        }
+    }
+
+    /** ~4.6MB per user for a 750-position cycle; a few ms to build (one FFT per cyclePos). */
+    static PnSpectra buildPnSpectra(long baseSeedState, long hopsPerCycle, int analysisSize) {
+        int half = analysisSize / 2;
+        int positions = Math.toIntExact(hopsPerCycle);
+        double[] re = new double[positions * (half + 1)];
+        double[] im = new double[positions * (half + 1)];
+        double[] mag = new double[positions * half];
+        double[] pnRe = new double[analysisSize];
+        double[] pnIm = new double[analysisSize];
+        long[] prngState = new long[1];
+
+        for (int cyclePos = 0; cyclePos < positions; cyclePos++) {
+            // Same per-frame generator as the JS embedder's _randForFrame.
+            prngState[0] = stateAfterDraws(baseSeedState, (long) cyclePos * analysisSize);
+            for (int k = 0; k < analysisSize; k++) {
+                pnRe[k] = mulberry32Next(prngState) * 2.0 - 1.0;
+                pnIm[k] = 0.0;
+            }
+            fft(pnRe, pnIm, false);
+
+            System.arraycopy(pnRe, 0, re, cyclePos * (half + 1), half + 1);
+            System.arraycopy(pnIm, 0, im, cyclePos * (half + 1), half + 1);
+            int magBase = cyclePos * half;
+            for (int k = 0; k < half; k++) {
+                mag[magBase + k] = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
+            }
+        }
+        return new PnSpectra(half, re, im, mag);
+    }
+
+    /**
      * Analyses {@code frameCount} hop-aligned frames of the recorded audio
      * starting at sample {@code sampleOffset} ("phase"), producing the
      * per-frame masking threshold the embedder would have used to shape its
@@ -239,14 +303,14 @@ final class WatermarkDsp {
      */
     static double scoreWithAnalysis(
             float[] samples, int sampleOffset, FrameAnalysis analysis,
-            long baseSeedState, long cyclePos, long hopsPerCycle,
+            PnSpectra pn, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
             double marginLinear, int frameCount,
-            double[] pnRe, double[] pnIm, double[] recon, long[] prngState) {
+            double[] pnRe, double[] pnIm, double[] recon) {
         return scoreWithAnalysisDetailed(
-                samples, sampleOffset, analysis, baseSeedState, cyclePos, hopsPerCycle,
+                samples, sampleOffset, analysis, pn, cyclePos, hopsPerCycle,
                 hop, analysisSize, numBands, window, binToBand, marginLinear, frameCount,
-                pnRe, pnIm, recon, prngState).average();
+                pnRe, pnIm, recon).average();
     }
 
     /**
@@ -256,7 +320,7 @@ final class WatermarkDsp {
      * normalised cross-correlation, returning the raw sum + count instead
      * of pre-averaging (see {@link ScoreDetail}).
      *
-     * CYCLE WRAP: each frame's PRNG state is derived fresh from
+     * CYCLE WRAP: each frame's PN spectrum is looked up fresh from
      * ((cyclePos + f) mod hopsPerCycle) — mirroring the embedder's
      * _randForFrame exactly — rather than letting one PRNG state advance
      * continuously across the whole scoring loop. Without this, a
@@ -280,13 +344,13 @@ final class WatermarkDsp {
      */
     static ScoreDetail scoreWithAnalysisDetailed(
             float[] samples, int sampleOffset, FrameAnalysis analysis,
-            long baseSeedState, long cyclePos, long hopsPerCycle,
+            PnSpectra pn, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
             double marginLinear, int frameCount,
-            double[] pnRe, double[] pnIm, double[] recon, long[] prngState) {
+            double[] pnRe, double[] pnIm, double[] recon) {
 
-        synthesizeRecon(analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
-                window, binToBand, marginLinear, frameCount, pnRe, pnIm, recon, prngState);
+        synthesizeRecon(analysis, pn, cyclePos, hopsPerCycle, hop, analysisSize,
+                window, binToBand, marginLinear, frameCount, pnRe, pnIm, recon);
         return correlateOnly(samples, sampleOffset, recon, hop, 0, frameCount);
     }
 
@@ -309,10 +373,10 @@ final class WatermarkDsp {
      * behavior, just relocated).
      */
     static void synthesizeRecon(
-            FrameAnalysis analysis, long baseSeedState, long cyclePos, long hopsPerCycle,
+            FrameAnalysis analysis, PnSpectra pn, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, float[] window, int[] binToBand,
             double marginLinear, int frameCount,
-            double[] pnRe, double[] pnIm, double[] recon, long[] prngState) {
+            double[] pnRe, double[] pnIm, double[] recon) {
 
         int reconLen = frameCount * hop + analysisSize;
         // Only clear the portion this call actually uses — reused across
@@ -321,35 +385,34 @@ final class WatermarkDsp {
         // rest of a buffer sized for the largest call this request makes.
         Arrays.fill(recon, 0, reconLen, 0.0);
 
+        int half = pn.half;
         for (int f = 0; f < frameCount; f++) {
             int off = f * hop;
 
-            // Fresh state per frame, wrapped to this frame's position
-            // within the cycle — matches _randForFrame in the JS embedder.
-            // Reuses prngState (mutated in place by mulberry32Next) instead
-            // of allocating a new long[] here: this runs inside a loop
-            // that can be frames x blocks x users per request — so
-            // per-frame allocation here was a real, avoidable GC cost.
-            long cyclePosF = (cyclePos + f) % hopsPerCycle;
-            prngState[0] = stateAfterDraws(baseSeedState, cyclePosF * (long) analysisSize);
-
-            for (int k = 0; k < analysisSize; k++) {
-                pnRe[k] = mulberry32Next(prngState) * 2.0 - 1.0;
-                pnIm[k] = 0.0;
-            }
-            fft(pnRe, pnIm, false);
+            // This frame's position within the cycle — matches
+            // _randForFrame in the JS embedder — selects its precomputed
+            // raw PN spectrum (see PnSpectra).
+            int cyclePosF = (int) ((cyclePos + f) % hopsPerCycle);
+            int binBase = cyclePosF * (half + 1);
+            int magBase = cyclePosF * half;
 
             double[] spreadThreshold = analysis.spreadThreshold[f];
-            for (int k = 0; k < analysisSize / 2; k++) {
+            for (int k = 0; k < half; k++) {
                 int b = binToBand[k];
-                double mag = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
-                double gain = (Math.sqrt(spreadThreshold[b]) * marginLinear) / mag;
-                pnRe[k] *= gain;
-                pnIm[k] *= gain;
+                double gain = (Math.sqrt(spreadThreshold[b]) * marginLinear) / pn.mag[magBase + k];
+                double re = pn.re[binBase + k] * gain;
+                double im = pn.im[binBase + k] * gain;
+                pnRe[k] = re;
+                pnIm[k] = im;
                 int mirror = (analysisSize - k) % analysisSize;
-                pnRe[mirror] = pnRe[k];
-                pnIm[mirror] = -pnIm[k];
+                pnRe[mirror] = re;
+                pnIm[mirror] = -im;
             }
+            // The embedder's gain loop stops at k < N/2, so the Nyquist bin
+            // keeps its RAW, unshaped PN value (an audio-independent
+            // component at fs/2). Reproduce that exactly.
+            pnRe[half] = pn.re[binBase + half];
+            pnIm[half] = pn.im[binBase + half];
 
             fft(pnRe, pnIm, true);
             for (int i = 0; i < analysisSize; i++) {

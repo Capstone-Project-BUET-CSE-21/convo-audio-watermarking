@@ -34,8 +34,8 @@ import java.util.concurrent.Executors;
  * differently and are searched differently:
  * 1. cyclePos — which position within the repeat cycle the recording's
  *    first frame corresponds to. Bounded to [0, hopsPerCycle), which is
- *    small and FIXED regardless of call length (e.g. ~3750 positions for a
- *    20-second cycle at a 256-sample hop / 48kHz) — but must be scanned
+ *    small and FIXED regardless of call length (750 positions for the current
+ *    4-second cycle at a 256-sample hop / 48kHz) — but must be scanned
  *    EXHAUSTIVELY (see stage 1 below): each step jumps the PRNG by a full
  *    analysisSize draws, so neighboring cyclePos values are statistically
  *    independent of each other, with no partial correlation to guide a
@@ -45,18 +45,17 @@ import java.util.concurrent.Executors;
  *    audio samples in their analysis window, so the score varies smoothly
  *    here — a coarse grid + local refine is valid for this dimension.
  *
- * Jumping the PRNG to a candidate cyclePos is O(1) (see
- * WatermarkDsp.stateAfterDraws) rather than stepping through every
- * preceding frame, and the audio-side masking-threshold analysis for a
- * given phase is shared across every user and every cyclePos candidate
- * tested at that phase (see WatermarkDsp.analyzeAudioFrames) since it
- * depends only on the recorded samples.
+ * Every user's PN spectrum for every cyclePos is built ONCE per search (see
+ * WatermarkDsp.PnSpectra) since it depends only on (seed, cyclePos), and
+ * the audio-side masking-threshold analysis for a given phase is shared
+ * across every user and every cyclePos candidate tested at that phase (see
+ * WatermarkDsp.analyzeAudioFrames) since it depends only on the recorded
+ * samples. What's left per candidate frame is one inverse FFT (the masking
+ * gains are audio-dependent) plus the correlation.
  *
- * SCHEMA NOTE: this assumes each user's registered config also carries a
- * cycleSeconds value matching what the embedder used (see
- * DetectionConfigProjection.getCycleSeconds()) — add this alongside
- * frameSize / analysisWindowSize / numBands if it isn't already present in
- * your config table/projection/DTO plumbing.
+ * Each user's cycle length comes from their own stored config
+ * (DetectionConfigView.getCycleSeconds()) and must match the cycleSeconds
+ * their embedder was actually given.
  */
 @Component
 class WatermarkSearchEngine {
@@ -399,7 +398,6 @@ class WatermarkSearchEngine {
         final double[] pnRe;
         final double[] pnIm;
         final double[] recon;
-        final long[] prngState = new long[1]; // reused instead of allocated per frame
 
         ScratchBuffers(int analysisSize, int maxReconLen) {
             pnRe = new double[analysisSize];
@@ -455,11 +453,17 @@ class WatermarkSearchEngine {
         int searchFrameCount = Math.min(SEARCH_FRAME_COUNT, numDetectorFrames);
 
         int phaseStride = Math.max(1, hop / PHASE_COARSE_CANDIDATES);
-        int maxReconLen = numDetectorFrames * hop + analysisSize;
+        // Stages 1/2 never synthesize more than searchFrameCount frames per
+        // candidate (stage 3 allocates its own block-sized buffers), so size
+        // each task's scratch reconstruction to that, NOT to the whole
+        // recording: one buffer is allocated per task, and a whole-recording
+        // buffer is hundreds of MB per task for a multi-minute upload.
+        int maxReconLen = searchFrameCount * hop + analysisSize;
         String passLabel = cyclePosLimit != null ? "cyclePosLimit=" + cyclePosLimit : "exhaustive";
 
         Map<String, BestAlignment> bestByUser = new ConcurrentHashMap<>();
         Map<String, Long> hopsPerCycleByUser = new HashMap<>();
+        Map<String, WatermarkDsp.PnSpectra> pnByUser = new HashMap<>();
         for (DetectionConfigView c : sessionConfigs) {
             bestByUser.put(c.getUserId(), new BestAlignment());
             // Each user's cycle length in hops — MUST match what their
@@ -467,11 +471,15 @@ class WatermarkSearchEngine {
             // in case that's ever configured per-user.
             long hopsPerCycle = Math.max(1, Math.round((c.getCycleSeconds() * sampleRate) / hop));
             hopsPerCycleByUser.put(c.getUserId(), hopsPerCycle);
+            // Read-only after this point; shared by every task for this user.
+            pnByUser.put(c.getUserId(), WatermarkDsp.buildPnSpectra(
+                    WatermarkDsp.resolveSeed(c.getSeed()), hopsPerCycle, analysisSize));
         }
 
         // ── Stage 1: coarse phase scan × EXHAUSTIVE cyclePos scan. The
         //    audio-side masking analysis for a given phase is
-        //    shared/sequential (cheap, one FFT pass over ~80 frames); for
+        //    shared/sequential (cheap, one FFT pass over SEARCH_FRAME_COUNT
+        //    frames); for
         //    each user at that phase, the cyclePos range is split into
         //    numWorkers chunks and every chunk — across every user — is
         //    submitted as its own independent task, so parallelism scales
@@ -516,6 +524,7 @@ class WatermarkSearchEngine {
                 int chunks = (int) Math.min(numWorkers, Math.max(1, totalCandidates));
                 long chunkSize = (totalCandidates + chunks - 1) / chunks;
                 BestAlignment ba = bestByUser.get(c.getUserId());
+                WatermarkDsp.PnSpectra pn = pnByUser.get(c.getUserId());
 
                 for (int ci = 0; ci < chunks; ci++) {
                     long startIdx = (long) ci * chunkSize;
@@ -536,7 +545,7 @@ class WatermarkSearchEngine {
                                     ? idx
                                     : hopsPerCycle - wrapLimitF + (idx - wrapLimitF);
                             double score = scoreCandidate(
-                                    samples, phaseF, analysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
+                                    samples, phaseF, analysis, c, pn, cyclePos, hopsPerCycle, hop, analysisSize,
                                     numBands, window, binToBand, framesAvailableF, buffers);
                             if (score > localBestScore) {
                                 localBestScore = score;
@@ -564,6 +573,7 @@ class WatermarkSearchEngine {
         for (DetectionConfigView c : sessionConfigs) {
             BestAlignment ba = bestByUser.get(c.getUserId());
             long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
+            WatermarkDsp.PnSpectra pn = pnByUser.get(c.getUserId());
             long cycleStride = 1;
 
             int phaseLo = Math.max(0, ba.phase - phaseStride);
@@ -607,7 +617,7 @@ class WatermarkSearchEngine {
                         }
 
                         double score = scoreCandidate(
-                                samples, phase, cachedAnalysis, c, cyclePos, hopsPerCycle, hop, analysisSize,
+                                samples, phase, cachedAnalysis, c, pn, cyclePos, hopsPerCycle, hop, analysisSize,
                                 numBands, window, binToBand, framesAvailable, buffers);
                         if (score > localBestScore) {
                             localBestScore = score;
@@ -640,8 +650,8 @@ class WatermarkSearchEngine {
                 BestAlignment ba = bestByUser.get(c.getUserId());
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
                 double score = driftTrackedFinalScore(
-                        samples, ba.phase, ba.cyclePos, c, hopsPerCycle, hop, analysisSize,
-                        numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount);
+                        samples, ba.phase, ba.cyclePos, c, pnByUser.get(c.getUserId()), hopsPerCycle, hop,
+                        analysisSize, numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount);
                 finalScores.put(c.getUserId(), score);
             }, userScoringExecutor));
         }
@@ -663,16 +673,15 @@ class WatermarkSearchEngine {
 
     private double scoreCandidate(
             float[] samples, int phase, WatermarkDsp.FrameAnalysis analysis,
-            DetectionConfigView config, long cyclePos, long hopsPerCycle,
+            DetectionConfigView config, WatermarkDsp.PnSpectra pn, long cyclePos, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
             int frameCount, ScratchBuffers buffers) {
 
-        long baseSeedState = WatermarkDsp.resolveSeed(config.getSeed());
         double marginLinear = Math.pow(10.0, config.getAlpha() / 20.0);
         return WatermarkDsp.scoreWithAnalysis(
-                samples, phase, analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
+                samples, phase, analysis, pn, cyclePos, hopsPerCycle, hop, analysisSize,
                 numBands, window, binToBand, marginLinear, frameCount,
-                buffers.pnRe, buffers.pnIm, buffers.recon, buffers.prngState);
+                buffers.pnRe, buffers.pnIm, buffers.recon);
     }
 
     /**
@@ -707,7 +716,7 @@ class WatermarkSearchEngine {
      */
     private double driftTrackedFinalScore(
             float[] samples, int lockPhase, long lockCyclePos,
-            DetectionConfigView config, long hopsPerCycle,
+            DetectionConfigView config, WatermarkDsp.PnSpectra pn, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
             float sampleRate, String userId, int lockSearchFrames) {
 
@@ -736,11 +745,9 @@ class WatermarkSearchEngine {
         double[] pnRe = new double[analysisSize];
         double[] pnIm = new double[analysisSize];
         double[] recon = new double[blockReconLen];
-        long[] prngState = new long[1];
         int candidateCount = 2 * DRIFT_PHASE_RADIUS + 1;
         double[] candidateScores = new double[candidateCount];
 
-        long baseSeedState = WatermarkDsp.resolveSeed(config.getSeed());
         double marginLinear = Math.pow(10.0, config.getAlpha() / 20.0);
 
         // ── Drift-slope model, fit online through CONFIDENT blocks only.
@@ -777,8 +784,8 @@ class WatermarkSearchEngine {
             WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
                     samples, predictedPhase, hop, analysisSize, numBands, window, binToBand, framesThisBlock);
             WatermarkDsp.synthesizeRecon(
-                    analysis, baseSeedState, cyclePos, hopsPerCycle, hop, analysisSize,
-                    window, binToBand, marginLinear, framesThisBlock, pnRe, pnIm, recon, prngState);
+                    analysis, pn, cyclePos, hopsPerCycle, hop, analysisSize,
+                    window, binToBand, marginLinear, framesThisBlock, pnRe, pnIm, recon);
 
             // ── Per-block search/score split: the local re-lock search
             //    below only ever looks at the block's FIRST searchFrames

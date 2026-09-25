@@ -53,6 +53,14 @@ public class WatermarkConfig {
     @Column(name = "cycle_seconds", nullable = false)
     private Double cycleSeconds;
 
+    // Sample rate (Hz) of the AudioContext the embedder runs in, as reported
+    // by the client. frameSize/cycleSeconds are measured in samples AT THIS
+    // RATE, so detection resamples every recording to it first. Nullable:
+    // rows issued before clients reported it fall back to the recording's
+    // own decoded rate (the pre-existing behavior).
+    @Column(name = "sample_rate")
+    private Integer sampleRate;
+
     // Getters and Setters
     public Long getId() {
         return id;
@@ -132,5 +140,13 @@ public class WatermarkConfig {
 
     public void setCycleSeconds(Double cycleSeconds) {
         this.cycleSeconds = cycleSeconds;
+    }
+
+    public Integer getSampleRate() {
+        return sampleRate;
+    }
+
+    public void setSampleRate(Integer sampleRate) {
+        this.sampleRate = sampleRate;
     }
 }

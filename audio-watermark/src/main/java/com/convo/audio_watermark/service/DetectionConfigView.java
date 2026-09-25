@@ -17,6 +17,7 @@ public class DetectionConfigView {
     private final Integer analysisWindowSize;
     private final Integer numBands;
     private final Double cycleSeconds;
+    private final Integer sampleRate; // null for configs issued before clients reported it
 
     public DetectionConfigView(
             String userId,
@@ -26,7 +27,8 @@ public class DetectionConfigView {
             Integer frameSize,
             Integer analysisWindowSize,
             Integer numBands,
-            Double cycleSeconds) {
+            Double cycleSeconds,
+            Integer sampleRate) {
         this.userId = userId;
         this.displayName = displayName;
         this.seed = seed;
@@ -35,6 +37,7 @@ public class DetectionConfigView {
         this.analysisWindowSize = analysisWindowSize;
         this.numBands = numBands;
         this.cycleSeconds = cycleSeconds;
+        this.sampleRate = sampleRate;
     }
 
     public String getUserId() { return userId; }
@@ -45,4 +48,5 @@ public class DetectionConfigView {
     public Integer getAnalysisWindowSize() { return analysisWindowSize; }
     public Integer getNumBands() { return numBands; }
     public Double getCycleSeconds() { return cycleSeconds; }
+    public Integer getSampleRate() { return sampleRate; }
 }

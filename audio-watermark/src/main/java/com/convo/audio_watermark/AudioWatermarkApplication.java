@@ -28,6 +28,7 @@ public class AudioWatermarkApplication {
         setPropertyIfPresent("spring-datasource-password", resolveValue("DB_PASS", localDotenv));
         setPropertyIfPresent("INTERNAL_SERVICE_KEY", resolveValue("INTERNAL_SERVICE_KEY", localDotenv));
         setPropertyIfPresent("CONVO_BACKEND_URL", resolveValue("CONVO_BACKEND_URL", localDotenv));
+        setPropertyIfPresent("JWT_SECRET", resolveValue("JWT_SECRET", localDotenv));
 
         SpringApplication.run(AudioWatermarkApplication.class, args);
     }
