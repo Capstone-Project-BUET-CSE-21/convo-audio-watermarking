@@ -39,34 +39,24 @@ public class WatermarkDetectionService {
     private static final Logger log = LoggerFactory.getLogger(WatermarkDetectionService.class);
 
     /**
-     * Minimum score to declare detection.
+     * Minimum consistency for a user to count as detected: the
+     * standardized statistic over the held-out frames
+     * (WatermarkDsp.ScoreDetail.detectionStat — mean per-frame correlation
+     * relative to its own frame-to-frame spread, scaled by sqrt(frames)).
      *
-     * IMPORTANT — CALIBRATION: this score is now an ENERGY-WEIGHTED
-     * aggregate over the whole recording (see WatermarkSearchEngine's
-     * driftTrackedFinalScore / WatermarkDsp.ScoreDetail.weightedAverage),
-     * not a plain per-frame average — the plain average was found to
-     * dilute genuine signal down toward the noise floor on real-world
-     * recordings with any non-trivial silent/low-SNR stretches (a
-     * recording where the correct user still ranked highest, but only
-     * ~0.007 vs ~0.0063 for the runner-up — both were being dragged down
-     * by noise-floor frames counted with equal weight to real ones). The
-     * weighted aggregate should sit noticeably higher for genuine
-     * detections than the old plain average did for the same audio, but
-     * this has still not been calibrated against a real corpus of
-     * known-good / known-bad recordings — treat 0.015 as a placeholder
-     * only, and re-run known-good/known-bad recordings through the NEW
-     * scoring method (not just re-use old measurements) before relying on
-     * this threshold in production.
+     * Decided on this rather than on the weighted score, because on real
+     * recordings the score's magnitude couldn't tell signal from noise:
+     * pure noise reached 0.060 while a genuine phone recording scored
+     * 0.06–0.14, and the old rule (score >= 0.015 and 0.01 ahead of the
+     * runner-up) named participants on noise — once the wrong one.
+     * Measured 2026-09-25 across synthetic tests and six real recordings:
+     *   genuine watermark:  11.6–18.7 on a real phone recording, 160 on a
+     *                       real in-app recording, 56–160 synthetic
+     *   wrong user / none:  never above 3.9 (~70 measurements)
+     * 6.0 leaves margin on both sides. Still a small real-world sample —
+     * revisit as more recordings with known answers come in.
      */
-    private static final double DETECTION_THRESHOLD = 0.015;
-
-    /**
-     * Minimum gap between the best and second-best score required to trust
-     * the winner. Without this, two close/noisy scores can flip the
-     * "detected" user essentially at random. Needs the same fresh
-     * calibration as DETECTION_THRESHOLD.
-     */
-    private static final double MIN_SCORE_MARGIN = 0.01;
+    static final double MIN_CONSISTENCY = 6.0;
 
     /**
      * Width, in EITHER direction, of the cheap fast-path window around
@@ -155,7 +145,8 @@ public class WatermarkDetectionService {
                     null, null, sessionId, 0.0, false, 0, 0,
                     Collections.emptyMap(),
                     Collections.emptyMap(),
-                    "No registered users found for watermark detection.");
+                    "No registered users found for watermark detection.",
+                    0.0, Collections.emptyMap());
         }
 
         // ── 2. Decode audio to float samples & extract sample rate ──────────
@@ -177,7 +168,8 @@ public class WatermarkDetectionService {
                     null, null, sessionId, 0.0, false, 0, sessionConfigs.size(),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
-                    "Audio file is empty or could not be decoded.");
+                    "Audio file is empty or could not be decoded.",
+                    0.0, Collections.emptyMap());
         }
 
         // All users in the same session share the same frameSize / analysisWindowSize / numBands
@@ -197,7 +189,8 @@ public class WatermarkDetectionService {
                     null, null, sessionId, 0.0, false, 0, sessionConfigs.size(),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
-                    "Audio too short for detection (need at least " + hop + " samples).");
+                    "Audio too short for detection (need at least " + hop + " samples).",
+                    0.0, Collections.emptyMap());
         }
 
         Map<String, String> userDisplayNames = new LinkedHashMap<>();
@@ -230,7 +223,7 @@ public class WatermarkDetectionService {
         //    exhaustive search's generality for EXTERNAL recorders while
         //    giving in-app ones a near-instant path.
         long fastPathStartNanos = System.nanoTime();
-        Map<String, Double> fastPathScores = searchAllRateGroups(
+        Map<String, WatermarkSearchEngine.UserScore> fastPathScores = searchAllRateGroups(
                 rateGroups, sessionConfigs, hop, analysisSize, numBands, window, FAST_PATH_CYCLE_POS_LIMIT);
         long fastPathNanos = System.nanoTime();
         log.info("watermark-detect[{}] fast-path search took {} ms", sessionId,
@@ -245,7 +238,7 @@ public class WatermarkDetectionService {
 
         // ── 3b. Fallback: full exhaustive cycle-bounded search ───────────────
         long fallbackStartNanos = System.nanoTime();
-        Map<String, Double> allUserScores = searchAllRateGroups(
+        Map<String, WatermarkSearchEngine.UserScore> allUserScores = searchAllRateGroups(
                 rateGroups, sessionConfigs, hop, analysisSize, numBands, window, null);
         long fallbackNanos = System.nanoTime();
         log.info("watermark-detect[{}] fallback (exhaustive) search took {} ms", sessionId,
@@ -289,94 +282,100 @@ public class WatermarkDetectionService {
     }
 
     /** One search pass per rate group, merged back into registration order. Scores are comparable across groups. */
-    private Map<String, Double> searchAllRateGroups(
+    private Map<String, WatermarkSearchEngine.UserScore> searchAllRateGroups(
             List<RateGroup> groups, List<DetectionConfigView> sessionConfigs,
             int hop, int analysisSize, int numBands, float[] window, Long cyclePosLimit) {
 
-        Map<String, Double> scoresByUser = new HashMap<>();
+        Map<String, WatermarkSearchEngine.UserScore> scoresByUser = new HashMap<>();
         for (RateGroup g : groups) {
             scoresByUser.putAll(searchEngine.findBestScoresAcrossUsers(
                     g.samples(), g.configs(), hop, analysisSize, numBands, g.sampleRate(),
                     window, g.binToBand(), cyclePosLimit));
         }
-        Map<String, Double> ordered = new LinkedHashMap<>();
+        Map<String, WatermarkSearchEngine.UserScore> ordered = new LinkedHashMap<>();
         for (DetectionConfigView c : sessionConfigs) {
             ordered.put(c.getUserId(), scoresByUser.get(c.getUserId()));
         }
         return ordered;
     }
 
+    /** Users ranked strongest first, and which of them reach MIN_CONSISTENCY. */
+    record Decision(String strongestUserId, List<String> detectedUserIds) {
+        boolean detected() { return !detectedUserIds.isEmpty(); }
+    }
+
     /**
-     * Picks the best/runner-up score, applies the detection threshold +
-     * margin, and builds the response DTO — shared between the fast-path
-     * check and the full-search fallback so both stages apply identical
-     * detection logic.
+     * The detection decision, kept free of I/O so it can be tested directly:
+     * users are ranked by consistency, and every user at or above
+     * MIN_CONSISTENCY counts as detected, strongest first. More than one
+     * can legitimately qualify — two participants' speakers can both reach
+     * one recording — so the others are reported rather than hidden.
+     */
+    static Decision decide(Map<String, WatermarkSearchEngine.UserScore> scores) {
+        List<String> ranked = scores.entrySet().stream()
+                .sorted((a, b) -> Double.compare(b.getValue().consistency(), a.getValue().consistency()))
+                .map(e -> e.getKey())
+                .toList();
+        List<String> detected = ranked.stream()
+                .filter(id -> scores.get(id).consistency() >= MIN_CONSISTENCY)
+                .toList();
+        return new Decision(ranked.isEmpty() ? null : ranked.get(0), detected);
+    }
+
+    /**
+     * Applies the decision (see decide) and builds the response DTO —
+     * shared between the fast-path check and the full-search fallback so
+     * both stages apply identical detection logic.
      */
     private WatermarkDetectionResponse buildDetectionResponse(
-            Map<String, Double> allUserScores,
+            Map<String, WatermarkSearchEngine.UserScore> allUserScores,
             List<DetectionConfigView> sessionConfigs,
             Map<String, String> userDisplayNames,
             String sessionId, int numFrames, String pathLabel) {
 
-        String bestUserId = null;
-        double bestScore = Double.NEGATIVE_INFINITY;
-        double secondBestScore = Double.NEGATIVE_INFINITY;
-        for (Map.Entry<String, Double> entry : allUserScores.entrySet()) {
-            double v = entry.getValue();
-            if (v > bestScore) {
-                secondBestScore = bestScore;
-                bestScore = v;
-                bestUserId = entry.getKey();
-            } else if (v > secondBestScore) {
-                secondBestScore = v;
-            }
+        Decision decision = decide(allUserScores);
+        String bestUserId = decision.strongestUserId();
+        WatermarkSearchEngine.UserScore best = allUserScores.get(bestUserId);
+        String bestName = userDisplayNames.getOrDefault(bestUserId, bestUserId);
+
+        String message = String.format("%s (%s). %s: '%s' | consistency=%.1f (threshold %.1f), score=%.4f",
+                decision.detected() ? "Watermark detected" : "No watermark detected", pathLabel,
+                decision.detected() ? "Detected user" : "Strongest", bestName,
+                best.consistency(), MIN_CONSISTENCY, best.score());
+        if (decision.detectedUserIds().size() > 1) {
+            message += " | also above threshold: " + decision.detectedUserIds().stream().skip(1)
+                    .map(id -> String.format("'%s' (consistency=%.1f)",
+                            userDisplayNames.getOrDefault(id, id), allUserScores.get(id).consistency()))
+                    .collect(Collectors.joining(", "));
         }
-        if (secondBestScore == Double.NEGATIVE_INFINITY) {
-            secondBestScore = bestScore;
-        }
-
-        // The margin check only makes sense when there's a runner-up to be
-        // confused with. With exactly one registered user, secondBestScore
-        // is set equal to bestScore just above (no real runner-up exists),
-        // which would make the margin exactly 0 and detection permanently
-        // impossible regardless of how strong the real score is — skip the
-        // margin requirement in that case and rely on the raw threshold.
-        boolean detected = bestScore >= DETECTION_THRESHOLD
-                && (allUserScores.size() == 1 || (bestScore - secondBestScore) >= MIN_SCORE_MARGIN);
-
-        final String finalBestUser = bestUserId;
-        DetectionConfigView winnerConfig = sessionConfigs.stream()
-                .filter(c -> c.getUserId().equals(finalBestUser))
-                .findFirst()
-                .orElse(sessionConfigs.get(0));
-
-        String message = detected
-                ? String.format(
-                        "Watermark detected (%s). Detected user: '%s' | score=%.6f (margin over runner-up=%.6f)",
-                        pathLabel, winnerConfig.getDisplayName(), bestScore, bestScore - secondBestScore)
-                : String.format(
-                        "No watermark detected (%s). Highest score: %.6f for user '%s' (margin over runner-up=%.6f)",
-                        pathLabel, bestScore, winnerConfig.getDisplayName(), bestScore - secondBestScore);
 
         Map<String, Double> roundedScores = new LinkedHashMap<>();
-        for (Map.Entry<String, Double> e : allUserScores.entrySet()) {
-            roundedScores.put(e.getKey(), round4(e.getValue()));
+        Map<String, Double> roundedConsistency = new LinkedHashMap<>();
+        for (Map.Entry<String, WatermarkSearchEngine.UserScore> e : allUserScores.entrySet()) {
+            roundedScores.put(e.getKey(), round4(e.getValue().score()));
+            roundedConsistency.put(e.getKey(), round2(e.getValue().consistency()));
         }
 
         return new WatermarkDetectionResponse(
-                detected ? winnerConfig.getUserId() : null,
-                detected ? winnerConfig.getDisplayName() : null,
+                decision.detected() ? bestUserId : null,
+                decision.detected() ? bestName : null,
                 sessionId,
-                round4(bestScore),
-                detected,
+                round4(best.score()),
+                decision.detected(),
                 numFrames,
                 sessionConfigs.size(),
                 roundedScores,
                 userDisplayNames,
-                message);
+                message,
+                round2(best.consistency()),
+                roundedConsistency);
     }
 
     private double round4(double v) {
         return Math.round(v * 10000.0) / 10000.0;
+    }
+
+    private double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
     }
 }

@@ -14,6 +14,10 @@ public class WatermarkDetectionResponse {
     private Map<String, Double> allUserScores; // userId -> score, for full transparency
     private Map<String, String> userDisplayNames; // userId -> display name
     private String message;
+    // The statistic detection is decided on (see WatermarkDetectionService.MIN_CONSISTENCY):
+    // the strongest user's, and every user's.
+    private double consistencyScore;
+    private Map<String, Double> allUserConsistency; // userId -> consistency
 
     public WatermarkDetectionResponse() {}
 
@@ -27,7 +31,9 @@ public class WatermarkDetectionResponse {
             int totalUsersChecked,
             Map<String, Double> allUserScores,
             Map<String, String> userDisplayNames,
-            String message) {
+            String message,
+            double consistencyScore,
+            Map<String, Double> allUserConsistency) {
         this.detectedUser = detectedUser;
         this.detectedUserDisplayName = detectedUserDisplayName;
         this.sessionId = sessionId;
@@ -38,6 +44,8 @@ public class WatermarkDetectionResponse {
         this.allUserScores = allUserScores;
         this.userDisplayNames = userDisplayNames;
         this.message = message;
+        this.consistencyScore = consistencyScore;
+        this.allUserConsistency = allUserConsistency;
     }
 
     public String getDetectedUser() { return detectedUser; }
@@ -69,4 +77,10 @@ public class WatermarkDetectionResponse {
 
     public String getMessage() { return message; }
     public void setMessage(String message) { this.message = message; }
+
+    public double getConsistencyScore() { return consistencyScore; }
+    public void setConsistencyScore(double consistencyScore) { this.consistencyScore = consistencyScore; }
+
+    public Map<String, Double> getAllUserConsistency() { return allUserConsistency; }
+    public void setAllUserConsistency(Map<String, Double> allUserConsistency) { this.allUserConsistency = allUserConsistency; }
 }

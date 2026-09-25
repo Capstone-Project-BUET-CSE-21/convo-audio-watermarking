@@ -63,6 +63,15 @@ class WatermarkSearchEngine {
     private static final Logger log = LoggerFactory.getLogger(WatermarkSearchEngine.class);
 
     /**
+     * One user's final result over the held-out frames: {@code score} is the
+     * energy-weighted average correlation (ScoreDetail.weightedAverage) and
+     * {@code consistency} the standardized statistic
+     * (ScoreDetail.detectionStat) that detection decisions are made on — see
+     * WatermarkDetectionService.MIN_CONSISTENCY.
+     */
+    record UserScore(double score, double consistency) {}
+
+    /**
      * Total coarse sample-phase candidates spread across one hop.
      *
      * CALIBRATED FROM MEASUREMENT, not a guess: probing the actual score-vs-
@@ -92,7 +101,7 @@ class WatermarkSearchEngine {
      * per request raises the noise-floor "best wrong score" via order
      * statistics, and 80 frames wasn't enough averaging per candidate to
      * keep the true one clear of it). 160 was verified against a
-     * known-failing case (scored 0.0145, under DETECTION_THRESHOLD, at 80)
+     * known-failing case (scored 0.0145, under the 0.015 threshold then in use, at 80)
      * and fully recovered it (0.288, matching the oracle ceiling). This
      * raises search cost roughly proportionally, which is an acceptable
      * trade now that the exhaustive search is only the FALLBACK path (see
@@ -190,7 +199,7 @@ class WatermarkSearchEngine {
      * near the noise floor" AND, worse, "an unrelated user sometimes
      * outranks the real recorder": SELECTION BIAS between the SEARCH
      * (argmax over many candidates) and the SCORE (the number actually
-     * compared against DETECTION_THRESHOLD / used to rank users).
+     * compared against the detection threshold / used to rank users).
      *
      * Every stage of this pipeline — stage 1's coarse phase x cyclePos
      * scan, stage 2's local refine, AND this stage's own per-block local
@@ -485,7 +494,7 @@ class WatermarkSearchEngine {
      *                      forward-only window scored that case as pure
      *                      noise and let another user's noise ceiling win.
      */
-    Map<String, Double> findBestScoresAcrossUsers(
+    Map<String, UserScore> findBestScoresAcrossUsers(
             float[] samples,
             List<DetectionConfigView> sessionConfigs,
             int hop, int analysisSize, int numBands, float sampleRate,
@@ -686,13 +695,13 @@ class WatermarkSearchEngine {
         //    O(blocks x frames) FFT work + a cheap O(blocks x candidates)
         //    correlation-only search, not O(blocks x candidates x frames)
         //    FFT work.
-        Map<String, Double> finalScores = new ConcurrentHashMap<>();
+        Map<String, UserScore> finalScores = new ConcurrentHashMap<>();
         List<CompletableFuture<Void>> finalFutures = new ArrayList<>(sessionConfigs.size());
         for (DetectionConfigView c : sessionConfigs) {
             finalFutures.add(CompletableFuture.runAsync(() -> {
                 BestAlignment ba = bestByUser.get(c.getUserId());
                 long hopsPerCycle = hopsPerCycleByUser.get(c.getUserId());
-                double score = driftTrackedFinalScore(
+                UserScore score = driftTrackedFinalScore(
                         samples, ba.phase, ba.cyclePos, c, pnByUser.get(c.getUserId()), hopsPerCycle, hop,
                         analysisSize, numBands, window, binToBand, sampleRate, c.getUserId(), searchFrameCount);
                 finalScores.put(c.getUserId(), score);
@@ -707,7 +716,7 @@ class WatermarkSearchEngine {
 
         // Preserve original registration order in the returned map (used
         // for display ordering downstream), since ConcurrentHashMap doesn't.
-        Map<String, Double> ordered = new LinkedHashMap<>();
+        Map<String, UserScore> ordered = new LinkedHashMap<>();
         for (DetectionConfigView c : sessionConfigs) {
             ordered.put(c.getUserId(), finalScores.get(c.getUserId()));
         }
@@ -757,7 +766,7 @@ class WatermarkSearchEngine {
      * every block in the walk, so a minute-long recording doesn't
      * multiply allocation cost by its length either.
      */
-    private double driftTrackedFinalScore(
+    private UserScore driftTrackedFinalScore(
             float[] samples, int lockPhase, long lockCyclePos,
             DetectionConfigView config, WatermarkDsp.PnSpectra pn, long hopsPerCycle,
             int hop, int analysisSize, int numBands, float[] window, int[] binToBand,
@@ -884,7 +893,7 @@ class WatermarkSearchEngine {
                 String.format("%.6f", weighted),
                 String.format("%.2f", total.detectionStat()),
                 String.format("%.6f", total.average()), total.scoredFrames);
-        return weighted;
+        return new UserScore(weighted, total.detectionStat());
     }
 
     /** One block's lock attempt: the chosen offset, its held-out score, and whether it passed the lock gate. */

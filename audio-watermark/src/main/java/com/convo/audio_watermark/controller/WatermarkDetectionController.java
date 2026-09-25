@@ -26,14 +26,15 @@ import java.util.Map;
  *   "detectedUser":            "&lt;userId&gt;",  // null if no watermark found
  *   "detectedUserDisplayName": "Alice",           // null if no watermark found
  *   "sessionId":               "abc123",
- *   "correlationScore":        0.2881,  // best user's energy-weighted score, in [−1, +1];
- *                                       // genuine hits typically land ~0.02–0.5, wrong users ~0
+ *   "consistencyScore":        18.74,   // strongest user's consistency: detected when >= 6.0
+ *   "correlationScore":        0.1214,  // that user's energy-weighted score, in [−1, +1]
  *   "watermarkDetected":       true,
  *   "totalFramesAnalyzed":     1125,
  *   "totalUsersChecked":       3,
- *   "allUserScores":    { "&lt;userId&gt;": 0.2881, ... },
- *   "userDisplayNames": { "&lt;userId&gt;": "Alice", ... },
- *   "message": "Watermark detected (near cyclePos=0 (either direction)). Detected user: 'Alice' | ..."
+ *   "allUserConsistency": { "&lt;userId&gt;": 18.74, ... },
+ *   "allUserScores":      { "&lt;userId&gt;": 0.1214, ... },
+ *   "userDisplayNames":   { "&lt;userId&gt;": "Alice", ... },
+ *   "message": "Watermark detected (full search). Detected user: 'Alice' | consistency=18.7 (threshold 6.0), ..."
  * }
  * </pre>
  */

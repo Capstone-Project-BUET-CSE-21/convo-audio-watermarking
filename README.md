@@ -80,10 +80,14 @@ recording is already at the embedder's rate.
 | `audio` | The recording (WAV, MP3, AAC, M4A, Opus, … up to 50 MB) |
 | `sessionId` | The meeting code to check participants of |
 
-Returns the best-matching participant, if any, plus every participant's score.
-A detection needs the best score to be at least `0.015` **and** at least `0.01`
-ahead of the runner-up (see `WatermarkDetectionService`). Both thresholds are
-still placeholders, not yet calibrated against a real corpus.
+Returns the best-matching participant, if any, plus every participant's score
+and **consistency**. A participant counts as detected when their consistency
+is at least `6.0` (see `WatermarkDetectionService.MIN_CONSISTENCY`).
+Consistency measures how steadily the watermark shows up across the whole
+recording, not how loud it is. On the recordings tested so far, genuine
+watermarks scored 11–160 and wrong participants never above 3.9. If several
+participants qualify, the strongest is named and the others are listed in
+`message`.
 
 The exhaustive fallback is CPU-heavy: expect tens of seconds per registered
 participant on a small instance.

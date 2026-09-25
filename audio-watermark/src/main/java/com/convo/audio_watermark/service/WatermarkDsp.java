@@ -236,10 +236,10 @@ final class WatermarkDsp {
          * seed) this is ~N(0,1) REGARDLESS of recording length, so it's
          * directly comparable across 2s and 5s and across users; under H1
          * (real, consistently-aligned watermark) it GROWS ~sqrt(n) with
-         * duration. Not used for the pass/fail decision (that stays on
-         * weightedAverage to preserve the calibrated threshold's meaning) —
-         * logged as a diagnostic so duration-dependent regressions are
-         * visible directly instead of inferred.
+         * duration. This is what the detection decision is made on (see
+         * WatermarkDetectionService.MIN_CONSISTENCY): on real recordings it
+         * separated genuine watermarks from noise cleanly, where the
+         * weightedAverage magnitude did not.
          */
         double detectionStat() {
             if (scoredFrames < 2) return 0.0;
