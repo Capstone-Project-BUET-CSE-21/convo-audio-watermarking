@@ -545,12 +545,26 @@ class WatermarkSearchEngine {
         //    (phase, cyclePos) was known: the subsampled search
         //    consistently missed it, reporting scores near the noise floor
         //    despite the true alignment scoring 5-40x higher.
+        //
+        //    Candidates are scored in the frequency domain
+        //    (WatermarkDsp.scoreSpectral): the audio-side half of every
+        //    correlation is computed once per phase, leaving a dot product
+        //    per candidate instead of synthesizing and inverse-transforming
+        //    each candidate's watermark — roughly 15x cheaper, which is what
+        //    makes retrying from several lock windows affordable. It ranks
+        //    candidates; stage 2 then re-scores the winner's neighbourhood
+        //    with the exact time-domain score. (Falls back to exact scoring
+        //    if a config ever uses other than 50% frame overlap.)
         for (int phase = 0; phase < hop; phase += phaseStride) {
             int framesAvailable = Math.min(searchFrameCount, (samples.length - phase) / hop);
             if (framesAvailable <= 0) continue;
 
             WatermarkDsp.FrameAnalysis analysis = WatermarkDsp.analyzeAudioFrames(
                     samples, phase, hop, analysisSize, numBands, window, binToBand, framesAvailable);
+            WatermarkDsp.SpectralFrames spectral = analysisSize == 2 * hop
+                    ? WatermarkDsp.buildSpectralFrames(
+                            samples, phase, analysis, framesAvailable, hop, analysisSize, window, binToBand)
+                    : null;
 
             final int phaseF = phase;
             final int framesAvailableF = framesAvailable;
@@ -577,6 +591,7 @@ class WatermarkSearchEngine {
                 long chunkSize = (totalCandidates + chunks - 1) / chunks;
                 BestAlignment ba = bestByUser.get(c.getUserId());
                 WatermarkDsp.PnSpectra pn = pnByUser.get(c.getUserId());
+                double marginLinear = Math.pow(10.0, c.getAlpha() / 20.0);
 
                 for (int ci = 0; ci < chunks; ci++) {
                     long startIdx = (long) ci * chunkSize;
@@ -584,7 +599,7 @@ class WatermarkSearchEngine {
                     if (startIdx >= endIdxExclusive) continue;
 
                     futures.add(CompletableFuture.runAsync(() -> {
-                        ScratchBuffers buffers = new ScratchBuffers(analysisSize, maxReconLen);
+                        ScratchBuffers buffers = spectral == null ? new ScratchBuffers(analysisSize, maxReconLen) : null;
                         double localBestScore = Double.NEGATIVE_INFINITY;
                         long localBestCyclePos = 0;
 
@@ -596,9 +611,10 @@ class WatermarkSearchEngine {
                             long cyclePos = (wrapLimitF == 0 || idx < wrapLimitF)
                                     ? idx
                                     : hopsPerCycle - wrapLimitF + (idx - wrapLimitF);
-                            double score = scoreCandidate(
-                                    samples, phaseF, analysis, c, pn, cyclePos, hopsPerCycle, hop, analysisSize,
-                                    numBands, window, binToBand, framesAvailableF, buffers);
+                            double score = spectral != null
+                                    ? WatermarkDsp.scoreSpectral(spectral, pn, cyclePos, hopsPerCycle, marginLinear)
+                                    : scoreCandidate(samples, phaseF, analysis, c, pn, cyclePos, hopsPerCycle, hop,
+                                            analysisSize, numBands, window, binToBand, framesAvailableF, buffers);
                             if (score > localBestScore) {
                                 localBestScore = score;
                                 localBestCyclePos = cyclePos;
@@ -632,6 +648,10 @@ class WatermarkSearchEngine {
             int phaseHi = Math.min(hop - 1, ba.phase + phaseStride);
             long cycleLo = Math.max(0, ba.cyclePos - cycleStride);
             long cycleHi = Math.min(hopsPerCycle - 1, ba.cyclePos + cycleStride);
+            // Stage 1's scores are the spectral approximation; the refine
+            // grid (which includes stage 1's winner) is chosen purely on
+            // exact scores, so don't let an approximate score compete.
+            ba.score = Double.NEGATIVE_INFINITY;
 
             int numPhases = phaseHi - phaseLo + 1;
             long numCycles = cycleHi - cycleLo + 1;

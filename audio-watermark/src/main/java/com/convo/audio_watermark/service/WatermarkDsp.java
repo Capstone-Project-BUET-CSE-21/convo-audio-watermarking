@@ -57,7 +57,8 @@ final class WatermarkDsp {
      * Stores the raw bins rather than unit phasors so {@link #synthesizeRecon}
      * computes exactly the same floating-point operations as before
      * (raw * (amp / mag)) — the cache changes speed, not a single bit of
-     * any score.
+     * any score. The unit phasors (raw / mag) are stored as well, for
+     * {@link #scoreSpectral}.
      *
      * Immutable once built; safe to share across concurrent search tasks.
      */
@@ -66,22 +67,28 @@ final class WatermarkDsp {
         final double[] re;   // [cyclePos * (half + 1) + k], k in [0, half] — includes the Nyquist bin
         final double[] im;
         final double[] mag;  // [cyclePos * half + k], k in [0, half) — |P_k| + 1e-12, the gain's denominator
+        final double[] unitRe; // [cyclePos * half + k], k in [0, half) — re / mag
+        final double[] unitIm;
 
-        private PnSpectra(int half, double[] re, double[] im, double[] mag) {
+        private PnSpectra(int half, double[] re, double[] im, double[] mag, double[] unitRe, double[] unitIm) {
             this.half = half;
             this.re = re;
             this.im = im;
             this.mag = mag;
+            this.unitRe = unitRe;
+            this.unitIm = unitIm;
         }
     }
 
-    /** ~4.6MB per user for a 750-position cycle; a few ms to build (one FFT per cyclePos). */
+    /** ~7.7MB per user for a 750-position cycle; a few ms to build (one FFT per cyclePos). */
     static PnSpectra buildPnSpectra(long baseSeedState, long hopsPerCycle, int analysisSize) {
         int half = analysisSize / 2;
         int positions = Math.toIntExact(hopsPerCycle);
         double[] re = new double[positions * (half + 1)];
         double[] im = new double[positions * (half + 1)];
         double[] mag = new double[positions * half];
+        double[] unitRe = new double[positions * half];
+        double[] unitIm = new double[positions * half];
         double[] pnRe = new double[analysisSize];
         double[] pnIm = new double[analysisSize];
         long[] prngState = new long[1];
@@ -99,10 +106,174 @@ final class WatermarkDsp {
             System.arraycopy(pnIm, 0, im, cyclePos * (half + 1), half + 1);
             int magBase = cyclePos * half;
             for (int k = 0; k < half; k++) {
-                mag[magBase + k] = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
+                double m = Math.sqrt(pnRe[k] * pnRe[k] + pnIm[k] * pnIm[k]) + 1e-12;
+                mag[magBase + k] = m;
+                unitRe[magBase + k] = pnRe[k] / m;
+                unitIm[magBase + k] = pnIm[k] / m;
             }
         }
-        return new PnSpectra(half, re, im, mag);
+        return new PnSpectra(half, re, im, mag, unitRe, unitIm);
+    }
+
+    /**
+     * Per-phase precomputation for {@link #scoreSpectral}: everything about
+     * the recorded audio at one phase that the stage-1 score needs, shared
+     * by every user and every cyclePos candidate tested at that phase.
+     *
+     * For frame f, the hop it's scored on (samples [phase + f*hop, +hop))
+     * holds frame f's windowed FIRST half plus frame f-1's windowed SECOND
+     * half (50% overlap-add). So the hop's correlation with a candidate's
+     * reconstruction is <uA, x_f> + <uB, x_{f-1}>, where uA/uB are that
+     * hop's audio under the corresponding half of the synthesis window,
+     * placed where it sits within each frame, and x is a frame's
+     * synthesized signal. By Parseval each inner product is a dot product
+     * of spectra, and a candidate's frame spectrum is just its unit PN
+     * phasors times the masking amplitudes sqrt(threshold) * margin — so
+     * the audio-side factors (spectrum of uA/uB times the amplitudes) are
+     * computed once here, leaving a 256-bin dot product per candidate per
+     * frame instead of synthesizing and inverse-transforming the frame.
+     */
+    static final class SpectralFrames {
+        final int frames, half, n;
+        final double[] aRe, aIm;   // [f * half + k]: spectrum of uA_f * sqrt(thr_f) * (1 or 2) / n
+        final double[] bRe, bIm;   // [f * half + k]: spectrum of uB_f * sqrt(thr_{f-1}) * (1 or 2) / n (f >= 1)
+        final double[] aNyquist;   // [f]: uA_f's Nyquist bin / n (multiplies the raw, unshaped PN Nyquist bin)
+        final double[] bNyquist;
+        final double[] audioPower; // [f]: sum of the hop's squared samples
+        final double[] shapedPower; // [f]: sum over all n bins of threshold_f (a frame's shaped power, before margin)
+        final double windowFirstHalfEnergy, windowSecondHalfEnergy;
+
+        private SpectralFrames(int frames, int half, int n, double[] aRe, double[] aIm, double[] bRe, double[] bIm,
+                               double[] aNyquist, double[] bNyquist, double[] audioPower, double[] shapedPower,
+                               double windowFirstHalfEnergy, double windowSecondHalfEnergy) {
+            this.frames = frames;
+            this.half = half;
+            this.n = n;
+            this.aRe = aRe;
+            this.aIm = aIm;
+            this.bRe = bRe;
+            this.bIm = bIm;
+            this.aNyquist = aNyquist;
+            this.bNyquist = bNyquist;
+            this.audioPower = audioPower;
+            this.shapedPower = shapedPower;
+            this.windowFirstHalfEnergy = windowFirstHalfEnergy;
+            this.windowSecondHalfEnergy = windowSecondHalfEnergy;
+        }
+    }
+
+    /** Builds {@link SpectralFrames} for one phase. Requires n == 2 * hop (the embedder's 50% overlap). */
+    static SpectralFrames buildSpectralFrames(float[] samples, int sampleOffset, FrameAnalysis analysis,
+                                              int frameCount, int hop, int n, float[] window, int[] binToBand) {
+        int half = n / 2;
+        double[] uaRe = new double[n], uaIm = new double[n], ubRe = new double[n], ubIm = new double[n];
+        double[] aRe = new double[frameCount * half], aIm = new double[frameCount * half];
+        double[] bRe = new double[frameCount * half], bIm = new double[frameCount * half];
+        double[] aNyquist = new double[frameCount], bNyquist = new double[frameCount];
+        double[] audioPower = new double[frameCount], shapedPower = new double[frameCount];
+        double[] amp = new double[half], prevAmp = new double[half];
+
+        double w1 = 0.0, w2 = 0.0;
+        for (int i = 0; i < hop; i++) {
+            w1 += (double) window[i] * window[i];
+            w2 += (double) window[hop + i] * window[hop + i];
+        }
+
+        for (int f = 0; f < frameCount; f++) {
+            int start = sampleOffset + f * hop;
+            Arrays.fill(uaRe, 0.0);
+            Arrays.fill(uaIm, 0.0);
+            Arrays.fill(ubRe, 0.0);
+            Arrays.fill(ubIm, 0.0);
+            double power = 0.0;
+            for (int i = 0; i < hop && start + i < samples.length; i++) {
+                double v = samples[start + i];
+                uaRe[i] = v * window[i];             // under frame f's first half
+                ubRe[hop + i] = v * window[hop + i]; // under frame f-1's second half
+                power += v * v;
+            }
+            audioPower[f] = power;
+            fft(uaRe, uaIm, false);
+            fft(ubRe, ubIm, false);
+
+            double[] threshold = analysis.spreadThreshold[f];
+            double shaped = 0.0;
+            for (int k = 0; k < half; k++) {
+                amp[k] = Math.sqrt(threshold[binToBand[k]]);
+                // Real signals: bins 1..half-1 stand for themselves AND their
+                // mirror, DC only for itself.
+                double weight = (k == 0 ? 1.0 : 2.0) / n;
+                aRe[f * half + k] = uaRe[k] * amp[k] * weight;
+                aIm[f * half + k] = uaIm[k] * amp[k] * weight;
+                if (f > 0) {
+                    bRe[f * half + k] = ubRe[k] * prevAmp[k] * weight;
+                    bIm[f * half + k] = ubIm[k] * prevAmp[k] * weight;
+                }
+                shaped += (k == 0 ? 1.0 : 2.0) * amp[k] * amp[k];
+            }
+            aNyquist[f] = uaRe[half] / n;
+            bNyquist[f] = ubRe[half] / n;
+            shapedPower[f] = shaped;
+            double[] t = prevAmp;
+            prevAmp = amp;
+            amp = t;
+        }
+        return new SpectralFrames(frameCount, half, n, aRe, aIm, bRe, bIm, aNyquist, bNyquist,
+                audioPower, shapedPower, w1, w2);
+    }
+
+    /**
+     * Stage-1 candidate score computed in the frequency domain — the same
+     * average of per-hop normalized correlations as {@link #scoreWithAnalysis},
+     * roughly 15x cheaper. The correlation itself is EXACT (Parseval, see
+     * {@link SpectralFrames}). The one approximation is the reconstruction's
+     * power per hop, which the normalization divides by: it depends on the
+     * candidate's PN phases only through chance, so it's replaced by its
+     * expected value over random phases, which is the same for every
+     * candidate apart from the unshaped Nyquist bin (handled exactly). That
+     * perturbs individual scores by a few percent, which is fine for the
+     * one job this is used for — ranking thousands of candidates to find
+     * the one worth refining. Stage 2 re-scores the neighbourhood of the
+     * winner exactly, and stage 3 computes the reported score exactly.
+     */
+    static double scoreSpectral(SpectralFrames sf, PnSpectra pn, long cyclePos, long hopsPerCycle, double marginLinear) {
+        int half = sf.half;
+        double nSquared = (double) sf.n * sf.n;
+        double total = 0.0;
+        int scored = 0;
+        double prevVariance = 0.0;
+        for (int f = 0; f < sf.frames; f++) {
+            int cp = (int) ((cyclePos + f) % hopsPerCycle);
+            int unitBase = cp * half, frameBase = f * half;
+            double shapedDot = 0.0;
+            for (int k = 0; k < half; k++) {
+                shapedDot += sf.aRe[frameBase + k] * pn.unitRe[unitBase + k]
+                        + sf.aIm[frameBase + k] * pn.unitIm[unitBase + k];
+            }
+            double nyquist = pn.re[cp * (half + 1) + half];
+            double corr = marginLinear * shapedDot + sf.aNyquist[f] * nyquist;
+            // Expected per-sample power of this frame's synthesized signal over random PN phases.
+            double variance = (marginLinear * marginLinear * sf.shapedPower[f] + nyquist * nyquist) / nSquared;
+            double reconPower = sf.windowFirstHalfEnergy * variance;
+            if (f > 0) {
+                int cpPrev = (int) ((cyclePos + f - 1) % hopsPerCycle);
+                int prevBase = cpPrev * half;
+                double prevDot = 0.0;
+                for (int k = 0; k < half; k++) {
+                    prevDot += sf.bRe[frameBase + k] * pn.unitRe[prevBase + k]
+                            + sf.bIm[frameBase + k] * pn.unitIm[prevBase + k];
+                }
+                corr += marginLinear * prevDot + sf.bNyquist[f] * pn.re[cpPrev * (half + 1) + half];
+                reconPower += sf.windowSecondHalfEnergy * prevVariance;
+            }
+            double denom = Math.sqrt(sf.audioPower[f] * reconPower);
+            if (denom > 1e-9) {
+                total += corr / denom;
+                scored++;
+            }
+            prevVariance = variance;
+        }
+        return scored > 0 ? total / scored : 0.0;
     }
 
     /**

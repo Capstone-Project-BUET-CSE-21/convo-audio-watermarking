@@ -89,8 +89,17 @@ watermarks scored 11–160 and wrong participants never above 3.9. If several
 participants qualify, the strongest is named and the others are listed in
 `message`.
 
-The exhaustive fallback is CPU-heavy: expect tens of seconds per registered
-participant on a small instance.
+In-app recordings are usually found by a fast search near the start of the
+watermark's cycle. Everything else goes to an exhaustive search. If the search
+from the start of the recording finds nothing, it's retried from up to 7 later
+points spread across the recording (at least 2 s apart), stopping at the first
+detection. Phone recordings often only lock from part of the recording, so a
+recording with no detectable watermark costs up to 8 times as much.
+
+Measured on an 8-core machine with two participants: 1.5 s for an in-app
+recording, and 6–13 s for 10–18 s phone recordings, including ones that need
+every retry. A small cloud instance with a fraction of a CPU will be several
+times slower.
 
 ---
 

@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 /**
  * The detection decision (WatermarkDetectionService.decide), using
@@ -65,6 +66,15 @@ class WatermarkDecisionTests {
         var d = WatermarkDetectionService.decide(scores("a", 0.09, 9.0, "b", 0.12, 18.7, "c", 0.01, 1.0));
         assertThat(d.detectedUserIds()).isEqualTo(List.of("b", "a"));
         assertThat(d.strongestUserId()).isEqualTo("b");
+    }
+
+    @Test
+    void lockWindowsSpreadAcrossTheRecording() {
+        assertThat(WatermarkDetectionService.lockWindowStarts(2.0)).containsExactly(0.0); // too short to retry
+        assertThat(WatermarkDetectionService.lockWindowStarts(9.8)).containsExactly(0.0, 2.0, 4.0, 6.0);
+        List<Double> longRecording = WatermarkDetectionService.lockWindowStarts(300.0);
+        assertThat(longRecording).hasSize(8).startsWith(0.0);
+        assertThat(longRecording.get(7)).isCloseTo(297.5, within(1e-9));
     }
 
     @Test

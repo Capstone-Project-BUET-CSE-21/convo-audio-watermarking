@@ -10,6 +10,7 @@ import org.springframework.web.multipart.MultipartFile;
 import javax.sound.sampled.UnsupportedAudioFileException;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -77,6 +78,24 @@ public class WatermarkDetectionService {
      * observed ~32ms (6-hop) gap.
      */
     private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
+
+    /**
+     * FULL-SEARCH LOCK WINDOWS. The alignment search only looks at
+     * SEARCH_FRAME_COUNT frames (~0.85s) at a time, and on real phone
+     * recordings whether a given stretch works is unpredictable: one locked
+     * from 1, 3, 7, 9 and 11s but not from 0s, another only from 10s. So
+     * when the search from the start finds nothing, it's retried from later
+     * points, stopping at the first that yields a detection. Windows are
+     * spread evenly across the recording, at least
+     * LOCK_WINDOW_MIN_SPACING_SECONDS apart, and each must leave
+     * LOCK_WINDOW_MIN_REMAINING_SECONDS after it to score. Every window
+     * costs a full exhaustive search, hence the cap — and trying more
+     * windows also gives noise more chances, which MIN_CONSISTENCY's margin
+     * (noise never above 3.9) absorbs at this count.
+     */
+    private static final int MAX_LOCK_WINDOWS = 8;
+    private static final double LOCK_WINDOW_MIN_SPACING_SECONDS = 2.0;
+    private static final double LOCK_WINDOW_MIN_REMAINING_SECONDS = 2.5;
 
     private final WatermarkConfigRepository repository;
     private final MeetingParticipantClient participantClient;
@@ -224,7 +243,7 @@ public class WatermarkDetectionService {
         //    giving in-app ones a near-instant path.
         long fastPathStartNanos = System.nanoTime();
         Map<String, WatermarkSearchEngine.UserScore> fastPathScores = searchAllRateGroups(
-                rateGroups, sessionConfigs, hop, analysisSize, numBands, window, FAST_PATH_CYCLE_POS_LIMIT);
+                rateGroups, sessionConfigs, hop, analysisSize, numBands, window, FAST_PATH_CYCLE_POS_LIMIT, 0.0);
         long fastPathNanos = System.nanoTime();
         log.info("watermark-detect[{}] fast-path search took {} ms", sessionId,
                 (fastPathNanos - fastPathStartNanos) / 1_000_000);
@@ -236,18 +255,48 @@ public class WatermarkDetectionService {
             return fastPathResponse;
         }
 
-        // ── 3b. Fallback: full exhaustive cycle-bounded search ───────────────
-        long fallbackStartNanos = System.nanoTime();
-        Map<String, WatermarkSearchEngine.UserScore> allUserScores = searchAllRateGroups(
-                rateGroups, sessionConfigs, hop, analysisSize, numBands, window, null);
-        long fallbackNanos = System.nanoTime();
-        log.info("watermark-detect[{}] fallback (exhaustive) search took {} ms", sessionId,
-                (fallbackNanos - fallbackStartNanos) / 1_000_000);
-        WatermarkDetectionResponse fallbackResponse = buildDetectionResponse(
-                allUserScores, sessionConfigs, userDisplayNames, sessionId, numFrames, "full search");
+        // ── 3b. Fallback: full exhaustive cycle-bounded search, locking from
+        //    several windows (see MAX_LOCK_WINDOWS) and stopping at the first
+        //    detection. If none detects, report the window whose strongest
+        //    user came closest.
+        WatermarkDetectionResponse closest = null;
+        for (double startSeconds : lockWindowStarts(samples.length / sampleRate)) {
+            long windowStartNanos = System.nanoTime();
+            Map<String, WatermarkSearchEngine.UserScore> scores = searchAllRateGroups(
+                    rateGroups, sessionConfigs, hop, analysisSize, numBands, window, null, startSeconds);
+            WatermarkDetectionResponse response = buildDetectionResponse(
+                    scores, sessionConfigs, userDisplayNames, sessionId, numFrames,
+                    String.format("full search from %.1f s", startSeconds));
+            log.info("watermark-detect[{}] full search from {} s took {} ms (strongest consistency {})",
+                    sessionId, String.format("%.1f", startSeconds),
+                    (System.nanoTime() - windowStartNanos) / 1_000_000, response.getConsistencyScore());
+            if (response.isWatermarkDetected()) {
+                closest = response;
+                break;
+            }
+            if (closest == null || response.getConsistencyScore() > closest.getConsistencyScore()) {
+                closest = response;
+            }
+        }
         log.info("watermark-detect[{}] total request time {} ms",
                 sessionId, (System.nanoTime() - requestStartNanos) / 1_000_000);
-        return fallbackResponse;
+        return closest;
+    }
+
+    /**
+     * Start times (seconds) of the full search's lock windows for a
+     * recording of this length: 0 first, then evenly spread (see
+     * MAX_LOCK_WINDOWS).
+     */
+    static List<Double> lockWindowStarts(double durationSeconds) {
+        double span = durationSeconds - LOCK_WINDOW_MIN_REMAINING_SECONDS;
+        if (span <= 0) return List.of(0.0);
+        double spacing = Math.max(LOCK_WINDOW_MIN_SPACING_SECONDS, span / (MAX_LOCK_WINDOWS - 1));
+        List<Double> starts = new ArrayList<>();
+        for (int i = 0; i < MAX_LOCK_WINDOWS && i * spacing <= span + 1e-9; i++) {
+            starts.add(i * spacing);
+        }
+        return starts;
     }
 
     /** Users whose embedders ran at one sample rate, and the recording decoded at that rate. */
@@ -281,15 +330,21 @@ public class WatermarkDetectionService {
         return groups;
     }
 
-    /** One search pass per rate group, merged back into registration order. Scores are comparable across groups. */
+    /**
+     * One search pass per rate group, locking from {@code startSeconds} into
+     * the recording, merged back into registration order. Scores are
+     * comparable across groups.
+     */
     private Map<String, WatermarkSearchEngine.UserScore> searchAllRateGroups(
             List<RateGroup> groups, List<DetectionConfigView> sessionConfigs,
-            int hop, int analysisSize, int numBands, float[] window, Long cyclePosLimit) {
+            int hop, int analysisSize, int numBands, float[] window, Long cyclePosLimit, double startSeconds) {
 
         Map<String, WatermarkSearchEngine.UserScore> scoresByUser = new HashMap<>();
         for (RateGroup g : groups) {
+            int start = Math.min(g.samples().length, (int) Math.round(startSeconds * g.sampleRate()));
+            float[] samples = start == 0 ? g.samples() : Arrays.copyOfRange(g.samples(), start, g.samples().length);
             scoresByUser.putAll(searchEngine.findBestScoresAcrossUsers(
-                    g.samples(), g.configs(), hop, analysisSize, numBands, g.sampleRate(),
+                    samples, g.configs(), hop, analysisSize, numBands, g.sampleRate(),
                     window, g.binToBand(), cyclePosLimit));
         }
         Map<String, WatermarkSearchEngine.UserScore> ordered = new LinkedHashMap<>();
