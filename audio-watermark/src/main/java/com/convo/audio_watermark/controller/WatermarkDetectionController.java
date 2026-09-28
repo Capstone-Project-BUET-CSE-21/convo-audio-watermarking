@@ -2,6 +2,8 @@ package com.convo.audio_watermark.controller;
 
 import com.convo.audio_watermark.dto.WatermarkDetectionResponse;
 import com.convo.audio_watermark.service.WatermarkDetectionService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -42,6 +44,8 @@ import java.util.Map;
 @RequestMapping("/api/audio-watermark")
 public class WatermarkDetectionController {
 
+    private static final Logger log = LoggerFactory.getLogger(WatermarkDetectionController.class);
+
     private final WatermarkDetectionService detectionService;
 
     public WatermarkDetectionController(WatermarkDetectionService detectionService) {
@@ -80,16 +84,19 @@ public class WatermarkDetectionController {
                             "detail", e.getMessage()));
 
         } catch (IOException e) {
+            log.warn("Failed to read uploaded audio for sessionId={}", sessionId, e);
             return ResponseEntity.internalServerError()
-                    .body(Map.of(
-                            "error", "Failed to read audio file.",
-                            "detail", e.getMessage()));
+                    .body(Map.of("error", "Failed to read audio file."));
 
         } catch (Exception e) {
+            // No e.getMessage() in the body: this endpoint is deliberately
+            // unauthenticated (see the class doc comment), so an internal
+            // exception message — which could mention ffmpeg output, an
+            // internal hostname, or similar — must not reach an anonymous
+            // caller. Full detail still goes to the server log.
+            log.error("Unexpected error during watermark detection for sessionId={}", sessionId, e);
             return ResponseEntity.internalServerError()
-                    .body(Map.of(
-                            "error", "An unexpected error occurred during detection.",
-                            "detail", e.getMessage()));
+                    .body(Map.of("error", "An unexpected error occurred during detection."));
         }
     }
 }

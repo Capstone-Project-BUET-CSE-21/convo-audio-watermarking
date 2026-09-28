@@ -2,6 +2,7 @@ package com.convo.audio_watermark.service;
 
 import com.convo.audio_watermark.entity.WatermarkConfig;
 import com.convo.audio_watermark.repository.WatermarkConfigRepository;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -95,7 +96,30 @@ public class WatermarkConfigService {
         config.setCycleSeconds(4.0);
         config.setSampleRate(sampleRate);
 
-        return repository.save(config);
+        return saveWithUniqueSeedRetry(config);
+    }
+
+    // existsBySeed below is a cheap pre-filter, not a race-safe guarantee:
+    // two concurrent issuances could both pass it for the same seed before
+    // either saves. The seed column's DB-level unique constraint is what
+    // actually enforces uniqueness; a losing concurrent writer gets a
+    // constraint violation here, on saveAndFlush (which forces it to
+    // surface immediately rather than at eventual transaction commit), and
+    // retries with a fresh seed rather than failing the request outright.
+    private static final int MAX_SEED_SAVE_ATTEMPTS = 5;
+
+    private WatermarkConfig saveWithUniqueSeedRetry(WatermarkConfig config) {
+        for (int attempt = 1; attempt <= MAX_SEED_SAVE_ATTEMPTS; attempt++) {
+            try {
+                return repository.saveAndFlush(config);
+            } catch (DataIntegrityViolationException conflict) {
+                if (attempt == MAX_SEED_SAVE_ATTEMPTS) {
+                    throw conflict;
+                }
+                config.setSeed(generateUniqueSeed());
+            }
+        }
+        throw new IllegalStateException("unreachable");
     }
 
     // Generate a unique 6-character alphanumeric seed
