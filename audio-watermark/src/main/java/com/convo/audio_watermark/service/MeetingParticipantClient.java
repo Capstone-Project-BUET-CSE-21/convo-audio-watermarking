@@ -12,9 +12,8 @@ import java.util.UUID;
 
 // Calls convo-backend's internal, server-to-server API for meeting
 // membership instead of this service holding its own copy of it or
-// joining across schemas directly against convo-backend's tables (the
-// meeting_user_id foreign key this replaced). Same pattern, same shared
-// credential, as convo-file-sharing's SessionParticipantService.
+// joining across schemas directly against convo-backend's tables. Same pattern, same shared
+// credential, as convo-file-sharing's UserLookupClient.
 @Service
 public class MeetingParticipantClient {
 

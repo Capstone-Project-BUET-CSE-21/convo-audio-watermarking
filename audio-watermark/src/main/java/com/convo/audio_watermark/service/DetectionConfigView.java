@@ -1,12 +1,10 @@
 package com.convo.audio_watermark.service;
 
-// Drop-in replacement for the old WatermarkConfigRepository.DetectionConfigProjection
-// (a native-SQL-backed JPA projection) — same accessor contract, but built
-// by joining a local WatermarkConfig row against a convo-backend
-// participant (MeetingParticipantClient.Participant) in Java, in
-// WatermarkDetectionService, instead of a native cross-service SQL join.
-// Every downstream consumer of these values (the DSP search/scoring code)
-// is unchanged.
+// One participant's watermark config plus their display name, as the search
+// and scoring code consume it. Built in WatermarkDetectionService by joining
+// a local WatermarkConfig row with the matching convo-backend participant
+// (MeetingParticipantClient.Participant) in Java, since this service never
+// queries convo-backend's tables directly.
 public class DetectionConfigView {
 
     private final String userId;
