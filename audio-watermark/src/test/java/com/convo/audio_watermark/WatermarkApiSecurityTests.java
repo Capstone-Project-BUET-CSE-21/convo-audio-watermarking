@@ -76,6 +76,20 @@ class WatermarkApiSecurityTests {
     }
 
     @Test
+    void configWithValidTokenButNoUidClaimIs401NotServerError() throws Exception {
+        Instant now = Instant.now();
+        String jwt = Jwts.builder()
+                .subject("someone@example.com")
+                .issuedAt(Date.from(now))
+                .expiration(Date.from(now.plusSeconds(300)))
+                .signWith(Keys.hmacShaKeyFor(SECRET.getBytes(StandardCharsets.UTF_8)))
+                .compact();
+        mvc.perform(get("/api/audio-watermark/config").param("roomId", ROOM)
+                        .header("Authorization", "Bearer " + jwt))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
     void configIsIssuedToTheTokensUserAndStoresSampleRate() throws Exception {
         mvc.perform(get("/api/audio-watermark/config").param("roomId", ROOM).param("sampleRate", "44100")
                         .header("Authorization", bearer(MEMBER, SECRET)))
