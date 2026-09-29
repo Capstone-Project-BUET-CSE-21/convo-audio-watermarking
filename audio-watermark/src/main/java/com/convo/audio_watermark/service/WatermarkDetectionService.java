@@ -77,7 +77,7 @@ public class WatermarkDetectionService {
      * 267ms of tolerance in each direction, comfortably more than the
      * observed ~32ms (6-hop) gap.
      */
-    private static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
+    static final long FAST_PATH_CYCLE_POS_LIMIT = 50;
 
     /**
      * FULL-SEARCH LOCK WINDOWS. The alignment search only looks at
